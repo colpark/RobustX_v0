@@ -17,7 +17,11 @@ class OmniBirdConfig:
     side: int = 32                # grid resolution per axis for serialization (32^3 = 32768 cells)
 
     # ── Per-sample budget ──────────────────────────────────────────────────
-    n_events_total: int = 2048    # total events per sample (after sub-sampling)
+    # n_events_total: cap events per sample.
+    #   > 0  -> sample to exactly this size, pad with zeros if clip is shorter
+    #   <= 0 -> use all real events; pad to n_events_max (key_padding_mask handles tail)
+    n_events_total: int = 2048
+    n_events_max:   int = 16384   # only used when n_events_total <= 0
     n_ctx: int = 1024             # context: ~50% of available events
     n_tgt_per_block: int = 64
     n_pred_blocks: int = 4

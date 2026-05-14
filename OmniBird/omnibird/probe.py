@@ -122,9 +122,16 @@ def quick_probe(
         ctx_s = b["ctx_signal"].to(device)
         ctx_c = b["ctx_coords"].to(device)
         ctx_o = _move_ords(orderings_from_batch(b, "ctx"), device)
-        g = _encode_g(context_encoder, ctx_s, ctx_c, ctx_o)            # (B, K, D)
+        ctx_kpm = b["ctx_kpm"].to(device) if "ctx_kpm" in b else None
+        with torch.no_grad():
+            context_encoder.eval()
+            g = context_encoder(ctx_s, ctx_c, ctx_o, key_padding_mask=ctx_kpm)
         if pool is not None:
             return pool(g)                                              # (B, D)
+        # Mean-pool only over real (non-pad) positions when a kpm is provided.
+        if ctx_kpm is not None:
+            mask = (~ctx_kpm).unsqueeze(-1).float()                     # (B, K, 1)
+            return (g * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         return g.mean(dim=1)                                            # (B, D)
 
     for _ in range(num_epochs):
