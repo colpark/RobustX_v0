@@ -203,7 +203,8 @@ class OmniBirdEventDataset(Dataset):
             }
             sample.update(self._pack_orderings("ctx",  ctx_ords))
             sample.update(self._pack_orderings("pool", pool_ords))
-            return sample
+            return {k: v.contiguous().clone() if isinstance(v, torch.Tensor) else v
+                    for k, v in sample.items()}
 
         # ---- test / probe path: full padded event set as context, no targets ----
         # We keep the padded shape so default batch collation works; the encoder
@@ -217,7 +218,8 @@ class OmniBirdEventDataset(Dataset):
             "label":      int(label),
         }
         sample.update(self._pack_orderings("ctx", ctx_ords))
-        return sample
+        return {k: v.contiguous().clone() if isinstance(v, torch.Tensor) else v
+                for k, v in sample.items()}
 
 
 def orderings_from_batch(batch: dict, prefix: str,
@@ -408,7 +410,7 @@ class OmniBirdPatchDataset(Dataset):
                 ctx_idx = np.concatenate([ctx_idx, fill])
 
             tgt_patch_centroids = patch_centroids[torch.from_numpy(tgt_idx)]
-            return {
+            sample = {
                 "pool_patch_events":    patch_events,
                 "pool_patch_centroids": patch_centroids,
                 "pool_patch_kpm":       patch_kpm,
@@ -418,6 +420,10 @@ class OmniBirdPatchDataset(Dataset):
                 "tgt_patch_centroids":  tgt_patch_centroids,
                 "label":                int(label),
             }
+            # Ensure every tensor owns its storage (default_collate can't
+            # resize numpy-backed / view storages in worker processes).
+            return {k: v.contiguous().clone() if isinstance(v, torch.Tensor) else v
+                    for k, v in sample.items()}
 
         # Test path: ALL real patches as context, no targets
         # (probe uses the encoder's per-patch features mean-pooled)
@@ -430,7 +436,7 @@ class OmniBirdPatchDataset(Dataset):
             pad = torch.full((self.ctx_max - len(ctx_idx),), ctx_idx[0].item() if len(ctx_idx) else 0,
                               dtype=ctx_idx.dtype)
             ctx_idx = torch.cat([ctx_idx, pad])
-        return {
+        sample = {
             "pool_patch_events":    patch_events,
             "pool_patch_centroids": patch_centroids,
             "pool_patch_kpm":       patch_kpm,
@@ -438,3 +444,5 @@ class OmniBirdPatchDataset(Dataset):
             "ctx_patch_idx":        ctx_idx,
             "label":                int(label),
         }
+        return {k: v.contiguous().clone() if isinstance(v, torch.Tensor) else v
+                for k, v in sample.items()}
