@@ -215,15 +215,19 @@ def convert_cifar10_dvs(raw_dir: str | Path, out_dir: str | Path,
 
 # EventScape per-Town zip URLs. Verified at the RAMNet project page; if these
 # 404, check https://rpg.ifi.uzh.ch/RAMNet.html for the current download links.
-# NOTE: the direct-URL pattern below is intentionally left as a placeholder.
-# As of writing, EventScape does NOT host an open-URL zip set — the project
-# page at https://rpg.ifi.uzh.ch/RAMNet.html links to a form-gated download
-# (Google Drive / institutional file server) which changes occasionally.
-# If you have current direct URLs, populate them here. Otherwise prefer the
-# Tonic-based path below (`tonic` subcommand) for any of the well-hosted
-# event-camera datasets.
+# EventScape direct download URLs — verified against the rpg_ramnet README
+# (https://github.com/uzh-rpg/rpg_ramnet, README.md lines 64-68):
+#
+#   Training Set   (71 GB):  http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town01-03_train.zip
+#   Validation Set (12 GB):  http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town05_val.zip
+#   Test Set       (14 GB):  http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town05_test.zip
+#
+# Note: these are large. Start with the validation set (smallest at 12 GB) for
+# development; switch to the full training set once your pipeline is verified.
 EVENTSCAPE_URLS = {
-    # "Town01_train":      "https://...your-current-url-here.../Town01_train.zip",
+    "train": "http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town01-03_train.zip",
+    "val":   "http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town05_val.zip",
+    "test":  "http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town05_test.zip",
 }
 
 
@@ -233,14 +237,13 @@ def eventscape_download_urls() -> dict:
     return dict(EVENTSCAPE_URLS)
 
 
-def download_eventscape(out_dir: str | Path, subsets=("Town01_train",), extract: bool = True):
+def download_eventscape(out_dir: str | Path, subsets=("val",), extract: bool = True):
     """Download one or more EventScape subsets to `out_dir`.
 
-    Subsets: any subset of EVENTSCAPE_URLS.keys() — default is the smallest
-    (Town01_train) for development. Full dataset is hundreds of GB.
-
-    If `extract` is True, unzip in place. Each Town/ directory contains
-    sequence subfolders with events.h5 + rgb/*.png + depth/*.png + semantic/*.png.
+    Subsets:
+        "val"   - 12 GB (smallest, RECOMMENDED first download for dev)
+        "test"  - 14 GB
+        "train" - 71 GB
     """
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     for name in subsets:
@@ -263,81 +266,96 @@ def download_eventscape(out_dir: str | Path, subsets=("Town01_train",), extract:
 
 
 def convert_eventscape(raw_dir: str | Path, out_dir: str | Path,
-                        events_per_window: int = 8192, time_window_us: int = 50_000):
+                        events_per_clip: int = 8192,
+                        sensor_hw=(256, 256)):
     """Convert an extracted EventScape directory to OmniBird's per-clip layout.
 
-    EventScape's native format per sequence:
+    Real EventScape layout (verified from rpg_ramnet/RAM_Net/data_loader/dataset.py):
+
         <raw_dir>/<sequence>/
-            events/events.h5            # /events/{x,y,t,p} datasets
-            rgb/0000.png, 0001.png ...
-            semantic/0000.png ...
+            events/   *_NNNN_events.npy      # raw events: (n, 4) columns (t, x, y, polarity)
+            frames/   *_NNNN_depth.npy        # per-pixel depth (float32)
+            rgb/      *_NNNN_image.png        # RGB frame
+            semantic/ *_NNNN_gt_labelIds.png  # per-pixel CARLA semantic class
 
-    We slice the event stream into windows of `time_window_us` centered on
-    each RGB-frame timestamp, take up to `events_per_window` events per slice,
-    and use the dominant semantic-segmentation class in the corresponding
-    frame as the coarse classification label.
+    Each per-frame `*_NNNN_*` group is one timestep. We treat each timestep as
+    one OmniBird clip and label it by the dominant CARLA semantic class
+    (np.bincount(seg.ravel()).argmax()). For the canonical depth-prediction
+    task, see Note A below.
 
-    Requires h5py (pip install h5py) and Pillow (pip install pillow).
+    Requires Pillow (pip install pillow).
+
+    Note A — labels:
+      EventScape's *native* supervision is per-pixel depth (regression) +
+      per-pixel semantic seg. There is NO per-clip classification label. The
+      single integer this converter writes is the *dominant CARLA semantic
+      class in the segmentation map of the same timestep*. This is a
+      pragmatic coarse classification target that lets OmniBird's existing
+      LinearProbe work; for the canonical RAMNet depth task you'd want a
+      per-pixel regression probe head instead.
     """
     try:
-        import h5py
         from PIL import Image
-    except ImportError as e:
-        print(f"missing dependency: {e}\n  pip install h5py pillow"); return
+    except ImportError:
+        print("missing dependency: pillow\n  pip install pillow"); return
 
     raw_dir = Path(raw_dir); out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     clip_idx = 0
-    sequences = sorted([d for d in raw_dir.rglob("events.h5")])
-    print(f"found {len(sequences)} sequences with events.h5")
+    H, W = sensor_hw
 
-    for ev_h5 in sequences:
-        seq_dir = ev_h5.parent.parent
-        with h5py.File(ev_h5, "r") as f:
-            ev_x = f["events"]["x"][:]
-            ev_y = f["events"]["y"][:]
-            ev_t = f["events"]["t"][:]
-            ev_p = f["events"]["p"][:]
-        rgb_dir      = seq_dir / "rgb"
-        semantic_dir = seq_dir / "semantic"
-        rgb_files = sorted(rgb_dir.glob("*.png"))
-        # We don't have per-frame timestamps from the filenames alone; assume
-        # uniform spacing across the event stream as a simple heuristic.
-        if len(rgb_files) == 0 or len(ev_t) == 0:
-            continue
-        t_min, t_max = int(ev_t.min()), int(ev_t.max())
-        rgb_timestamps = np.linspace(t_min, t_max, len(rgb_files)).astype(np.int64)
+    # Find every sequence — defined by having an events/ folder with raw events npys
+    sequences = []
+    for events_dir in raw_dir.rglob("events"):
+        if events_dir.is_dir() and any(events_dir.glob("*_events.npy")):
+            sequences.append(events_dir.parent)
+    sequences = sorted(set(sequences))
+    print(f"found {len(sequences)} EventScape sequences")
 
-        for i, t_center in enumerate(rgb_timestamps):
-            lo, hi = t_center - time_window_us//2, t_center + time_window_us//2
-            mask = (ev_t >= lo) & (ev_t <= hi)
-            n = int(mask.sum())
-            if n < 64:
+    for seq_dir in sequences:
+        ev_dir   = seq_dir / "events"
+        sem_dir  = seq_dir / "semantic"
+        rgb_dir  = seq_dir / "rgb"
+        # Index by the 4-digit frame id at the end of the events filename
+        ev_files = sorted(ev_dir.glob("*_events.npy"))
+        for ev_file in ev_files:
+            # *_NNNN_events.npy  →  frame id = the 4-digit stem
+            stem = ev_file.stem.replace("_events", "")
+            frame_id = stem[-4:]                  # last 4 chars are the zero-padded id
+            sem_match = list(sem_dir.glob(f"*_{frame_id}_gt_labelIds.png"))
+            rgb_match = list(rgb_dir.glob(f"*_{frame_id}_image.png"))
+
+            # Load raw events. EventScape format: columns (t, x, y, polarity).
+            ev_raw = np.load(ev_file)
+            if ev_raw.size == 0:
                 continue
-            ev = np.stack([ev_x[mask], ev_y[mask], ev_t[mask], ev_p[mask]], axis=1).astype(np.float32)
-            if n > events_per_window:
-                sel = np.random.choice(n, events_per_window, replace=False)
-                sel.sort()
-                ev = ev[sel]
+            # Reorder to OmniBird's expected (x, y, t, polarity)
+            ev_full = np.stack([ev_raw[:, 1], ev_raw[:, 2], ev_raw[:, 0], ev_raw[:, 3]],
+                                axis=1).astype(np.float32)
+            n = ev_full.shape[0]
+            if n > events_per_clip:
+                sel = np.random.choice(n, events_per_clip, replace=False); sel.sort()
+                ev_full = ev_full[sel]
 
-            # Label: dominant semantic class in the matching segmentation frame
-            sem_file = semantic_dir / rgb_files[i].name
+            # Coarse classification label = dominant CARLA semantic class in
+            # this timestep's segmentation map.
             label = 0
-            if sem_file.exists():
-                sem = np.asarray(Image.open(sem_file))
+            if sem_match:
+                sem = np.asarray(Image.open(sem_match[0]))
                 if sem.ndim == 3:
-                    sem = sem[..., 0]
-                # CARLA's semantic palette uses small ints; take the mode
+                    sem = sem[..., 0]    # CARLA stores class id in the R channel
                 label = int(np.bincount(sem.ravel()).argmax())
 
-            clip_dir = out_dir / f"clip_{clip_idx:05d}"; clip_dir.mkdir(parents=True, exist_ok=True)
-            np.save(clip_dir / "events_0.npy", ev)
+            clip_dir = out_dir / f"clip_{clip_idx:06d}"; clip_dir.mkdir(parents=True, exist_ok=True)
+            np.save(clip_dir / "events_0.npy", ev_full)
             (clip_dir / "label_0.txt").write_text(str(label))
-            # Also copy the paired RGB frame for multimodal mode (Phase 2)
-            try:
-                Image.open(rgb_files[i]).save(clip_dir / "rgb_0.png")
-            except Exception:
-                pass
+            if rgb_match:
+                try:
+                    Image.open(rgb_match[0]).save(clip_dir / "rgb_0.png")
+                except Exception:
+                    pass
             clip_idx += 1
+            if clip_idx % 500 == 0:
+                print(f"  wrote {clip_idx} clips so far ...")
 
     print(f"\nwrote {clip_idx} clips to {out_dir}")
 
@@ -447,8 +465,9 @@ def _main():
 
     p_es    = sub.add_parser("eventscape",   help="download EventScape (CARLA) subsets")
     p_es.add_argument("--out", required=True, help="destination directory")
-    p_es.add_argument("--subsets", nargs="*", default=["Town01_train"],
-                      help="which Town_split zips to fetch")
+    p_es.add_argument("--subsets", nargs="*", default=["val"],
+                      choices=list(EVENTSCAPE_URLS.keys()),
+                      help="train (71GB) / val (12GB, default) / test (14GB)")
     p_es.add_argument("--no-extract", action="store_true")
 
     p_ces   = sub.add_parser("convert_eventscape", help="convert EventScape → OmniBird layout")

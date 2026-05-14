@@ -122,26 +122,62 @@ the OmniBird per-clip layout (events_*.npy + label_*.txt).
 
 ### Option B — EventScape (CARLA driving simulation, the primary robotics target)
 
-Project page: [https://rpg.ifi.uzh.ch/RAMNet.html](https://rpg.ifi.uzh.ch/RAMNet.html).
-The current hosting is form-gated (no plain HTTP URLs). To use it:
+URLs verified against the [`uzh-rpg/rpg_ramnet`](https://github.com/uzh-rpg/rpg_ramnet)
+README:
 
-1. Visit the RAMNet project page and follow their download instructions
-   (typically a Google Drive link revealed after submitting a brief form).
-2. Place the downloaded zips in `./data/eventscape_raw/`.
-3. If you want the auto-download path to work, paste the current direct URLs
-   into the `EVENTSCAPE_URLS` dict at the top of `datasets/download.py`, then:
+  - Training Set (71 GB): http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town01-03_train.zip
+  - Validation Set (12 GB): http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town05_val.zip
+  - Test Set (14 GB): http://rpg.ifi.uzh.ch/data/RAM_Net/dataset/Town05_test.zip
 
 ```bash
+cd OmniBird
+pip install pillow
+
+# 1) Download. Start with the validation set — smallest at 12 GB.
 python -m datasets.download eventscape \
     --out ./data/eventscape_raw \
-    --subsets Town01_train
+    --subsets val
 
-# Once raw data is on disk, convert it to OmniBird's layout:
-pip install h5py pillow
+# 2) Convert raw EventScape (per-frame *_NNNN_{events,depth,image,gt_labelIds}.npy/.png)
+#    into OmniBird's per-clip layout (events_0.npy + label_0.txt + rgb_0.png).
 python -m datasets.download convert_eventscape \
     --raw ./data/eventscape_raw \
     --out ./data/eventscape_omnibird
 ```
+
+#### EventScape's per-frame file layout (after extraction)
+
+```
+<raw_dir>/<sequence>/
+  events/   *_NNNN_events.npy       # raw events (n, 4): t, x, y, polarity
+  frames/   *_NNNN_depth.npy        # per-pixel depth — RAMNet's primary target
+  rgb/      *_NNNN_image.png        # RGB frame
+  semantic/ *_NNNN_gt_labelIds.png  # per-pixel CARLA semantic class
+```
+
+#### Labels in EventScape — IMPORTANT
+
+EventScape is a **depth-prediction** dataset, not a classification dataset. The
+native supervision targets are **per-pixel depth** (regression) and **per-pixel
+semantic segmentation**. There is no built-in per-clip classification label.
+
+`convert_eventscape` writes a single integer per clip = the **dominant CARLA
+semantic class** in the segmentation map. This is a pragmatic coarse label
+that lets OmniBird's existing `LinearProbe(D_model, n_classes)` head produce
+a sensible accuracy number. The CARLA semantic palette (the values you'll see
+in `label_0.txt`):
+
+```
+ 0 Unlabeled    1 Building     2 Fence       3 Other        4 Pedestrian
+ 5 Pole         6 Road line    7 Road        8 Sidewalk     9 Vegetation
+10 Vehicle     11 Wall        12 Traffic    13 Sky         14 Ground
+15 Bridge      16 Rail track  (more in newer CARLA versions)
+```
+
+For the canonical RAMNet benchmark you'd want **per-pixel depth regression**
+instead — which needs a different probe head (per-token depth output, MSE
+loss). The single-modality JEPA pretraining is the same either way; only the
+downstream probe changes.
 
 Then in the training notebook, swap the synthetic dataset for:
 ```python
