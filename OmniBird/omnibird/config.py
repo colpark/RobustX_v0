@@ -45,11 +45,21 @@ class OmniBirdConfig:
     n_layers_pred: int = 4
     predictor_pos_symmetric: bool = True
 
-    # ── BigBird sparse attention ───────────────────────────────────────────
-    block_size: int = 8
+    # ── Sparse attention ───────────────────────────────────────────────────
+    # attention_type:
+    #   "bigbird" — BigBird block-sparse: window + globals + random key blocks
+    #               per query block. Compute ~ O(N · K_attended · Dh).
+    #   "grouped" — Dense self-attention WITHIN non-overlapping windows of
+    #               `group_size`. Compute ~ O(N · group_size · Dh).
+    #               Receptive field stays global through depth because each
+    #               encoder layer picks a different curve, so group composition
+    #               changes layer-to-layer.
+    attention_type: str = "bigbird"
+    block_size: int = 8           # used only when attention_type=="bigbird"
     window: int = 1
     n_random: int = 2
     n_global: int = 2
+    group_size: int = 16          # used only when attention_type=="grouped"
 
     # ── Serialization ──────────────────────────────────────────────────────
     serial_orders: Tuple[str, ...] = ('z', 'z_rev', 'hilbert', 'hilbert_rev')

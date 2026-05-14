@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import MultiHeadAttention, BigBirdSparseAttention
+from .attention import MultiHeadAttention, BigBirdSparseAttention, GroupedSparseAttention
 
 
 # ---------------------------------------------------------------------------
@@ -107,17 +107,33 @@ def _gather_mask(mask, perm):
 
 
 class EncoderBlock(nn.Module):
-    """One block: order-permute → BigBird sparse self-attn → FFN → un-permute."""
+    """One block: order-permute → sparse self-attn → FFN → un-permute.
+
+    Two attention flavors, selected by `attention_type`:
+      "bigbird": BigBird block-sparse (window + globals + random).
+      "grouped": dense self-attention WITHIN windows of size `group_size`;
+                 cross-window mixing comes from the next layer's different
+                 curve choice. Cheaper, comparable receptive field via depth.
+    """
 
     def __init__(self, dim, n_heads=8, dim_head=32, block_size=32,
-                 window=1, n_random=2, n_global=2, ffn_mult=4):
+                 window=1, n_random=2, n_global=2, ffn_mult=4,
+                 attention_type: str = "bigbird", group_size: int = 16):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = BigBirdSparseAttention(
-            dim, n_heads=n_heads, dim_head=dim_head,
-            block_size=block_size, window=window,
-            n_random=n_random, n_global=n_global,
-        )
+        self.attention_type = attention_type
+        if attention_type == "grouped":
+            self.attn = GroupedSparseAttention(
+                dim, n_heads=n_heads, dim_head=dim_head, group_size=group_size,
+            )
+            self.required_multiple = group_size
+        else:
+            self.attn = BigBirdSparseAttention(
+                dim, n_heads=n_heads, dim_head=dim_head,
+                block_size=block_size, window=window,
+                n_random=n_random, n_global=n_global,
+            )
+            self.required_multiple = block_size
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, mult=ffn_mult)
 
@@ -169,20 +185,30 @@ class OmniBirdEncoder(nn.Module):
                  ffn_mult=4, signal_dim=1, coord_dim=3,
                  fourier_dim=96, fourier_scale=15.0,
                  serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
-                 reinject_pos=False):
+                 reinject_pos=False,
+                 attention_type: str = "bigbird", group_size: int = 16):
         super().__init__()
         self.tokenizer = Tokenizer(d_model, signal_dim=signal_dim, coord_dim=coord_dim,
                                     fourier_dim=fourier_dim, fourier_scale=fourier_scale)
+        self.attention_type = attention_type
+        self.group_size = group_size
+        # Padding multiple depends on which attention we use.
+        self.pad_multiple = group_size if attention_type == "grouped" else block_size
         self.blocks = nn.ModuleList([
             EncoderBlock(d_model, n_heads=n_heads, dim_head=dim_head,
                          block_size=block_size, window=window,
                          n_random=n_random, n_global=n_global,
-                         ffn_mult=ffn_mult)
+                         ffn_mult=ffn_mult,
+                         attention_type=attention_type,
+                         group_size=group_size)
             for _ in range(n_layers)
         ])
         self.norm = nn.LayerNorm(d_model)
         self.serial_orders = tuple(serial_orders)
         self.block_size = block_size
+        # `block_size` retains its name for back-compat in callers and for
+        # _pad_to_block_multiple. We pad to `pad_multiple` instead so the
+        # group_size case works correctly.
         self.reinject_pos = reinject_pos
 
     def compute_pos_emb(self, coords):
@@ -235,7 +261,7 @@ class OmniBirdEncoder(nn.Module):
         # earlier layers re-shuffled the sequence.
         pos_emb = self.compute_pos_emb(coords) if self.reinject_pos else None
 
-        x, pm, K_orig = self._pad_to_block_multiple(x, self.block_size, key_padding_mask)
+        x, pm, K_orig = self._pad_to_block_multiple(x, self.pad_multiple, key_padding_mask)
         B, Kp, D = x.shape
 
         # Pad pos_emb to the same length with zeros (padded positions don't matter

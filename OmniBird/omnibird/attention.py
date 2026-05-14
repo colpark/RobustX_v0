@@ -209,12 +209,70 @@ class BigBirdSparseAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# GroupedSparseAttention — window-grouped, dense within each window
+# ---------------------------------------------------------------------------
+
+class GroupedSparseAttention(nn.Module):
+    """Window-grouped self-attention along a 1-D (re-)serialized sequence.
+
+    After the encoder block gathers tokens into one of the 4 curve orderings,
+    we slice the sequence into non-overlapping windows of `group_size` G and
+    run dense self-attention WITHIN each window only. No cross-window mixing
+    this layer.
+
+    Compute: O(N · G · Dh) — much cheaper than BigBird's O(N · K_attended)
+    and ~G²-fold cheaper than dense O(N² · Dh).
+
+    Receptive field stays global through DEPTH because OmniBirdEncoder picks
+    a different serialization per layer, so a token's group neighbors at
+    layer ℓ are a different set than at layer ℓ+1. For G=16, ~log_16(N)
+    layers suffice for global mixing.
+    """
+
+    def __init__(self, dim, n_heads: int = 8, dim_head: int = 32,
+                 group_size: int = 16, bias_qkv: bool = False):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.group_size = group_size
+        self.to_qkv = nn.Linear(dim, inner * 3, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+
+    def forward(self, x, key_padding_mask=None):
+        """x: (B, N, D). N must be divisible by group_size (caller pads).
+        key_padding_mask: (B, N) bool, True at padded positions.
+        """
+        B, N, D = x.shape
+        G = self.group_size
+        assert N % G == 0, f"N={N} must be divisible by group_size={G}"
+        H, Dh = self.n_heads, self.dim_head
+        NG = N // G
+
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # (B, N, H*Dh) -> (B, NG, G, H, Dh) -> (B, NG, H, G, Dh)
+        q = q.view(B, NG, G, H, Dh).permute(0, 1, 3, 2, 4)
+        k = k.view(B, NG, G, H, Dh).permute(0, 1, 3, 2, 4)
+        v = v.view(B, NG, G, H, Dh).permute(0, 1, 3, 2, 4)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale         # (B, NG, H, G, G)
+        if key_padding_mask is not None:
+            kpm = key_padding_mask.view(B, NG, G).unsqueeze(2).unsqueeze(3)
+            scores = scores.masked_fill(kpm, float("-inf"))
+        attn = scores.softmax(dim=-1)
+        out = attn @ v                                           # (B, NG, H, G, Dh)
+        out = out.permute(0, 1, 3, 2, 4).contiguous().view(B, N, H * Dh)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
 # Convenience: tied factory
 # ---------------------------------------------------------------------------
 
 def make_attention(kind: str, **kw):
     if kind == "dense":
-        # Filter to args MultiHeadAttention accepts
         return MultiHeadAttention(
             kw["dim"], n_heads=kw.get("n_heads", 8),
             dim_head=kw.get("dim_head", 32),
@@ -222,4 +280,11 @@ def make_attention(kind: str, **kw):
         )
     elif kind == "bigbird":
         return BigBirdSparseAttention(**kw)
+    elif kind == "grouped":
+        return GroupedSparseAttention(
+            kw["dim"], n_heads=kw.get("n_heads", 8),
+            dim_head=kw.get("dim_head", 32),
+            group_size=kw.get("group_size", 16),
+            bias_qkv=kw.get("bias_qkv", False),
+        )
     raise ValueError(f"unknown attention kind: {kind}")
