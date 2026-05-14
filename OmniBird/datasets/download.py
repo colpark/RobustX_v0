@@ -125,34 +125,79 @@ def download_cifar10_dvs(out_dir: str | Path):
     print(f"Next: convert with `python -m datasets.download convert_cifar10_dvs --raw {out_dir} --out <omnibird_layout_dir>`")
 
 
-def _parse_aedat31_events(aedat_bytes: bytes, sensor_h: int = 128, sensor_w: int = 128):
-    """Minimal AEDAT 3.1 polarity-event parser.
-
-    AEDAT 3.1 polarity events are 8 bytes each:
-        uint32: data (bit 0 = polarity, bits 1-10 = y, bits 11-21 = x)
-        int32:  timestamp_us
-    Many CIFAR10-DVS files use sensor size 128 × 128.
-
-    Returns (N_raw, 4) float32 with columns (x_int, y_int, t_us, polarity{0,1}).
-    """
-    header_end = aedat_bytes.find(b"#End Of ASCII Header\r\n")
-    if header_end < 0:
-        header_end = 0
+def _strip_aedat_header(blob: bytes) -> tuple:
+    """Skip ASCII header lines (each starts with '#') and return (body, format).
+    `format` is 'aedat2', 'aedat3', or 'unknown'."""
+    head_text = blob[:1024].decode('ascii', errors='ignore')
+    if 'AER-DAT3' in head_text:
+        fmt = 'aedat3'
+    elif 'AER-DAT2' in head_text or '!AER-DAT' in head_text:
+        fmt = 'aedat2'
     else:
-        header_end += len(b"#End Of ASCII Header\r\n")
+        fmt = 'unknown'
+    offset = 0
+    while offset < len(blob) and blob[offset:offset+1] == b'#':
+        eol = blob.find(b'\n', offset)
+        if eol < 0:
+            break
+        offset = eol + 1
+    return blob[offset:], fmt
 
-    body = aedat_bytes[header_end:]
-    n_events = len(body) // 8
-    if n_events == 0:
+
+def _parse_aedat2_dvs128_events(body: bytes) -> np.ndarray:
+    """AEDAT 2.0 DVS128 polarity-event parser. CIFAR10-DVS uses this format.
+
+    Per event (8 bytes, BIG-ENDIAN):
+        uint32: address       — bit 0 = polarity, bits 1-7 = y (0..127), bits 8-14 = x (0..127)
+        uint32: timestamp_us  — recording-local microseconds
+
+    Returns (N, 4) float32: (x_int, y_int, t_us, polarity in {0,1}).
+    """
+    n = len(body) // 8
+    if n == 0:
         return np.zeros((0, 4), dtype=np.float32)
+    raw = np.frombuffer(body[:n * 8], dtype='>u4').reshape(-1, 2)   # big-endian u32 pairs
+    addr = raw[:, 0]
+    t_us = raw[:, 1].astype(np.int64)
+    pol   = (addr & 1).astype(np.float32)
+    y_int = ((addr >> 1) & 0x7F).astype(np.float32)                  # 7-bit y
+    x_int = ((addr >> 8) & 0x7F).astype(np.float32)                  # 7-bit x
+    return np.stack([x_int, y_int, t_us.astype(np.float32), pol], axis=1)
 
-    raw = np.frombuffer(body[: n_events * 8], dtype=np.uint32).reshape(-1, 2).copy()
+
+def _parse_aedat3_polarity_events(body: bytes) -> np.ndarray:
+    """AEDAT 3.1 polarity event-packet parser. Each event is 8 bytes (little-endian):
+        uint32: data       — bit 0 = polarity, bits 1-10 = y, bits 11-21 = x
+        int32:  timestamp_us
+    """
+    n = len(body) // 8
+    if n == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    raw = np.frombuffer(body[:n * 8], dtype=np.uint32).reshape(-1, 2)
     data = raw[:, 0]
     t_us = raw[:, 1].view(np.int32).astype(np.int64)
-    pol = (data & 1).astype(np.float32)
+    pol   = (data & 1).astype(np.float32)
     y_int = ((data >> 1) & 0x3FF).astype(np.float32)
     x_int = ((data >> 11) & 0x7FF).astype(np.float32)
     return np.stack([x_int, y_int, t_us.astype(np.float32), pol], axis=1)
+
+
+def _parse_aedat31_events(aedat_bytes: bytes, sensor_h: int = 128, sensor_w: int = 128):
+    """Dispatch AEDAT 2.0 / 3.1 polarity-event parsing based on header.
+
+    CIFAR10-DVS uses AEDAT 2.0 on a DVS128 sensor. Many newer datasets use 3.1.
+    Returns (N_raw, 4) float32 with columns (x_int, y_int, t_us, polarity in {0,1}).
+    """
+    body, fmt = _strip_aedat_header(aedat_bytes)
+    if fmt == 'aedat2':
+        return _parse_aedat2_dvs128_events(body)
+    elif fmt == 'aedat3':
+        return _parse_aedat3_polarity_events(body)
+    else:
+        # Heuristic fallback: CIFAR10-DVS files often lack a discoverable version
+        # tag in the first 1KB. The AEDAT 2.0 DVS128 layout is the safer default
+        # for CIFAR10-DVS specifically.
+        return _parse_aedat2_dvs128_events(body)
 
 
 def convert_cifar10_dvs(raw_dir: str | Path, out_dir: str | Path,
