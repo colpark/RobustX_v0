@@ -546,3 +546,122 @@ class PerceiverPredictor(nn.Module):
             q = q + blk["ffn"](blk["norm_f"](q))
 
         return self.proj_out(self.norm(q))
+
+
+# ---------------------------------------------------------------------------
+# Patchifier — mini-PointNet over per-patch event chunks
+# ---------------------------------------------------------------------------
+
+class Patchifier(nn.Module):
+    """Mini-PointNet that maps a chunk of K events → 1 D-dim token.
+
+    Input per patch is (K, 4): K events × (x, y, t, polarity-or-onehot).
+    For each event we compute:
+        rel_coord  = coord - patch_centroid             # local frame
+        rel_pos_emb = γ(rel_coord)
+        feat       = MLP_event([signal ⊕ rel_pos_emb])  # per-event embedding
+    Then max-pool over K to one D-dim token, refine with a second MLP.
+
+    The patch's *absolute* position is reintroduced by the caller via
+    pos_proj(γ(patch_centroid)) so the token has both local-shape and
+    global-position information.
+    """
+
+    def __init__(self, signal_dim, coord_dim, d_model,
+                 fourier_dim=96, fourier_scale=15.0, hidden=None):
+        super().__init__()
+        hidden = hidden or d_model
+        self.gff = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
+        # Per-event MLP: signal + γ(rel_coord) → hidden
+        per_event_in = signal_dim + 2 * fourier_dim
+        self.mlp_event = nn.Sequential(
+            nn.Linear(per_event_in, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        # Post-pool refine
+        self.mlp_patch = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(self, patch_events, patch_centroids, kpm_per_event=None):
+        """
+        patch_events:    (B, P, K, signal_dim + coord_dim)
+        patch_centroids: (B, P, coord_dim)
+        kpm_per_event:   (B, P, K) bool — True at padded events; sets their
+                         contribution to -inf in max-pool.
+        Returns: tokens (B, P, D_model)
+        """
+        coord_dim = patch_centroids.shape[-1]
+        coords  = patch_events[..., :coord_dim]                          # (B, P, K, D_c)
+        signal  = patch_events[..., coord_dim:]                          # (B, P, K, signal_dim)
+
+        rel = coords - patch_centroids.unsqueeze(2)                       # local-frame coords
+        rel_emb = self.gff(rel)                                           # (B, P, K, 2*fourier)
+
+        feat = torch.cat([signal, rel_emb], dim=-1)                       # (B, P, K, S + 2F)
+        feat = self.mlp_event(feat)                                       # (B, P, K, hidden)
+
+        if kpm_per_event is not None:
+            # Mask out padded events from max-pool
+            feat = feat.masked_fill(kpm_per_event.unsqueeze(-1), float("-inf"))
+
+        pooled = feat.max(dim=2).values                                   # (B, P, hidden)
+        # Replace any -inf rows (all-padding patch) with zeros to keep grads clean
+        pooled = torch.where(torch.isinf(pooled), torch.zeros_like(pooled), pooled)
+        return self.mlp_patch(pooled)                                     # (B, P, D_model)
+
+
+# ---------------------------------------------------------------------------
+# PatchOmniBirdEncoder — runs on patch tokens (not events)
+# ---------------------------------------------------------------------------
+
+class PatchOmniBirdEncoder(nn.Module):
+    """Encoder that consumes pre-organized event patches and runs attention on
+    the resulting patch tokens (Point-MAE / Point-BERT style).
+
+    Inputs at forward time:
+        patch_events:    (B, P, K, signal_dim + coord_dim)
+        patch_centroids: (B, P, coord_dim)
+        patch_kpm:       (B, P) bool — True for all-padding patches
+        kpm_per_event:   (B, P, K) bool — True for padded events inside patches (optional)
+
+    Output:
+        per-patch features (B, P, D_model).
+    """
+
+    def __init__(self, d_model=256, n_layers=6, n_heads=8, dim_head=32,
+                 ffn_mult=4, signal_dim=1, coord_dim=3,
+                 fourier_dim=96, fourier_scale=15.0,
+                 patch_size: int = 32):
+        super().__init__()
+        self.patchify = Patchifier(signal_dim, coord_dim, d_model,
+                                    fourier_dim=fourier_dim,
+                                    fourier_scale=fourier_scale)
+        self.gff_abs = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
+        self.abs_pos_proj = nn.Linear(2 * fourier_dim, d_model)
+
+        # Dense transformer over patch tokens (P typically 64-256, dense is fine)
+        self.blocks = nn.ModuleList()
+        for _ in range(n_layers):
+            self.blocks.append(nn.ModuleDict({
+                "norm1": nn.LayerNorm(d_model),
+                "attn":  MultiHeadAttention(d_model, n_heads=n_heads, dim_head=dim_head),
+                "norm2": nn.LayerNorm(d_model),
+                "ffn":   FeedForward(d_model, mult=ffn_mult),
+            }))
+        self.norm = nn.LayerNorm(d_model)
+        self.patch_size = patch_size
+
+    def forward(self, patch_events, patch_centroids, patch_kpm=None,
+                kpm_per_event=None):
+        # mini-PointNet → patch tokens
+        tokens = self.patchify(patch_events, patch_centroids, kpm_per_event=kpm_per_event)
+        # Absolute-position residual
+        tokens = tokens + self.abs_pos_proj(self.gff_abs(patch_centroids))
+
+        for blk in self.blocks:
+            tokens = tokens + blk["attn"](blk["norm1"](tokens),
+                                            key_padding_mask=patch_kpm)
+            tokens = tokens + blk["ffn"](blk["norm2"](tokens))
+        return self.norm(tokens)

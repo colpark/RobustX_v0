@@ -14,8 +14,12 @@ from .model import (
     EncoderBlock, OmniBirdEncoder,
     PredictorBlock, OmniBirdPredictor,
     HierarchicalEncoderBlock, PerceiverPredictor,
+    Patchifier, PatchOmniBirdEncoder,
 )
-from .data import OmniBirdEventDataset, build_loaders, orderings_from_batch
+from .data import (
+    OmniBirdEventDataset, OmniBirdPatchDataset,
+    build_loaders, orderings_from_batch,
+)
 from .jepa import (
     ema_update, make_momentum_schedule, TargetCenter,
     gather_target_features, gather_group_target_features,
@@ -37,8 +41,10 @@ __all__ = [
     "GaussianFourierFeatures", "Tokenizer", "FeedForward",
     "EncoderBlock", "OmniBirdEncoder", "PredictorBlock", "OmniBirdPredictor",
     "HierarchicalEncoderBlock", "PerceiverPredictor",
+    "Patchifier", "PatchOmniBirdEncoder",
     # data
-    "OmniBirdEventDataset", "build_loaders", "orderings_from_batch",
+    "OmniBirdEventDataset", "OmniBirdPatchDataset",
+    "build_loaders", "orderings_from_batch",
     # jepa
     "ema_update", "make_momentum_schedule", "TargetCenter",
     "gather_target_features", "gather_group_target_features",

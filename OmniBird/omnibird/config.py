@@ -76,6 +76,17 @@ class OmniBirdConfig:
     #   0.03-0.05 -> typical for event clouds in [-1, 1]^3
     context_target_margin: float = 0.0
 
+    # ── Patch-based mode (Point-MAE-aligned full) ──────────────────────────
+    # When True, the dataset organizes events into fixed-size patches via
+    # Hilbert-curve sort + reshape, and the encoder runs on patch tokens
+    # produced by a mini-PointNet. Multi-block masking happens at the patch
+    # level: 4 target blocks of `patches_per_block` patches each.
+    patch_mode: bool = False
+    patch_size: int = 32            # events per patch (K)
+    patches_per_block: int = 16     # target patches per block
+    ctx_max_patches: int = 192      # max context patches per sample
+    patch_curve: str = "hilbert"    # which curve to sort by for patching
+
     # ── JEPA ───────────────────────────────────────────────────────────────
     loss_type: str = "cosine"     # canonical v2 default
     use_centering: bool = False   # canonical i-JEPA: no DINO centering
