@@ -1,4 +1,11 @@
-"""End-to-end JEPA training with the PointBigBird backbone on CIFAR-10."""
+"""End-to-end JEPA training with the PointBigBird backbone on CIFAR-10.
+
+Includes an embedded linear probe that runs every `cfg.probe_interval`
+epochs (default: 20), trains for `cfg.probe_epochs` epochs on
+`train_eval_loader` (K_HALF context — same contract as test_loader), and
+reports `test_acc(K_HALF)`. The probe is recorded into `history['probe_accs']`
+and checkpointed with the model.
+"""
 from __future__ import annotations
 
 import os, time, copy, argparse
@@ -14,7 +21,8 @@ from pbb import (
     build_loaders, orderings_from_batch,
     TargetCenter, ema_update, make_momentum_schedule,
     gather_target_features, jepa_loss, diag_dict, fmt_diag,
-    save_atomic, ensure_dir, short_params,
+    quick_probe,
+    save_atomic, ensure_dir, short_params, count_params,
 )
 
 
@@ -24,13 +32,19 @@ def main():
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--ckpt_dir", type=str, default=None)
+    p.add_argument("--probe_interval", type=int, default=None,
+                   help="run a linear probe every N epochs (0 disables)")
+    p.add_argument("--probe_epochs", type=int, default=None,
+                   help="probe is trained for this many epochs each time")
     args = p.parse_args()
 
     cfg = PBBConfig()
-    if args.epochs:     cfg.epochs = args.epochs
-    if args.batch_size: cfg.batch_size = args.batch_size
-    if args.lr:         cfg.lr = args.lr
-    if args.ckpt_dir:   cfg.ckpt_dir = args.ckpt_dir
+    if args.epochs:         cfg.epochs = args.epochs
+    if args.batch_size:     cfg.batch_size = args.batch_size
+    if args.lr:             cfg.lr = args.lr
+    if args.ckpt_dir:       cfg.ckpt_dir = args.ckpt_dir
+    if args.probe_interval is not None: cfg.probe_interval = args.probe_interval
+    if args.probe_epochs is not None:   cfg.probe_epochs = args.probe_epochs
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ensure_dir(cfg.ckpt_dir)
@@ -61,8 +75,10 @@ def main():
     ).to(device)
     center = TargetCenter(cfg.d_model, momentum=cfg.center_momentum).to(device)
 
-    print(f"context_encoder: {short_params(context_encoder)}  "
-          f"predictor: {short_params(predictor)}")
+    print(f"context_encoder: {short_params(context_encoder)} "
+          f"({count_params(context_encoder):,})")
+    print(f"predictor      : {short_params(predictor)} "
+          f"({count_params(predictor):,})")
 
     params = list(context_encoder.parameters()) + list(predictor.parameters())
     opt = AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -70,10 +86,13 @@ def main():
     sched = CosineAnnealingLR(opt, T_max=total_steps)
     mgen  = make_momentum_schedule(cfg.ema_start, cfg.ema_end, total_steps)
 
-    history = {"loss": [], "probe_acc": []}
+    history = {"loss": [], "diag_steps": [], "diag_log": [], "probe_accs": []}
     global_step = 0
     best_loss = float("inf")
     m = cfg.ema_start
+
+    def _move_ords(ords):
+        return {k: {kk: vv.to(device) for kk, vv in v.items()} for k, v in ords.items()}
 
     for epoch in range(1, cfg.epochs + 1):
         context_encoder.train(); predictor.train()
@@ -87,18 +106,16 @@ def main():
             pool_c = batch["pool_coords"].to(device)
             tgt_c  = batch["tgt_coords"].to(device)
             tgt_pp = batch["tgt_pool_pos"].to(device)
-            ctx_ords  = {k: {kk: vv.to(device) for kk, vv in v.items()}
-                          for k, v in orderings_from_batch(batch, "ctx").items()}
-            pool_ords = {k: {kk: vv.to(device) for kk, vv in v.items()}
-                          for k, v in orderings_from_batch(batch, "pool").items()}
+            ctx_o  = _move_ords(orderings_from_batch(batch, "ctx"))
+            pool_o = _move_ords(orderings_from_batch(batch, "pool"))
 
             with torch.no_grad():
-                g_tgt = target_encoder(pool_p, pool_c, pool_ords)
+                g_tgt = target_encoder(pool_p, pool_c, pool_o)
                 h_tgt_raw = gather_target_features(g_tgt, tgt_pp)
                 center.update(h_tgt_raw)
                 h_tgt = F.layer_norm(center(h_tgt_raw), (h_tgt_raw.size(-1),))
 
-            g_ctx = context_encoder(ctx_p, ctx_c, ctx_ords)
+            g_ctx = context_encoder(ctx_p, ctx_c, ctx_o)
             h_pred = predictor(g_ctx, tgt_c)
 
             loss = jepa_loss(h_pred, h_tgt)
@@ -117,27 +134,50 @@ def main():
             if global_step % cfg.log_every == 0:
                 d = diag_dict(loss, h_pred, h_tgt, g_ctx, center)
                 print(fmt_diag(d, global_step, epoch, sched.get_last_lr()[0], m))
+                history["diag_steps"].append(global_step)
+                history["diag_log"].append(d)
 
         avg = epoch_loss / max(steps, 1)
         history["loss"].append(avg)
-        print(f"=== ep {epoch:03d}/{cfg.epochs}  avg_loss={avg:.4f}  "
-              f"m={m:.4f}  {time.time()-t0:.1f}s ===")
+        improved = avg < best_loss
+        if improved: best_loss = avg
 
-        if avg < best_loss:
-            best_loss = avg
-            save_atomic({
-                "epoch": epoch, "cfg": cfg.__dict__,
-                "context_encoder": context_encoder.state_dict(),
-                "target_encoder":  target_encoder.state_dict(),
-                "predictor":       predictor.state_dict(),
-                "center":          center.state_dict(),
-                "opt":             opt.state_dict(),
-                "sched":           sched.state_dict(),
-                "global_step":     global_step,
-                "history":         history,
-            }, os.path.join(cfg.ckpt_dir, "pbb_best.pt"))
-        save_atomic({"epoch": epoch, "context_encoder": context_encoder.state_dict()},
-                    os.path.join(cfg.ckpt_dir, "pbb_last.pt"))
+        ckpt_state = {
+            "epoch": epoch, "cfg": cfg.__dict__,
+            "context_encoder": context_encoder.state_dict(),
+            "target_encoder":  target_encoder.state_dict(),
+            "predictor":       predictor.state_dict(),
+            "center":          center.state_dict(),
+            "opt":             opt.state_dict(),
+            "sched":           sched.state_dict(),
+            "global_step":     global_step,
+            "best_loss":       best_loss,
+            "history":         history,
+        }
+        if improved:
+            save_atomic(ckpt_state, os.path.join(cfg.ckpt_dir, "pbb_best.pt"))
+        save_atomic(ckpt_state, os.path.join(cfg.ckpt_dir, "pbb_last.pt"))
+
+        tag = "  * new best (saved pbb_best.pt)" if improved else ""
+        print(f"=== ep {epoch:03d}/{cfg.epochs}  avg_loss={avg:.4f}  "
+              f"m={m:.4f}  {time.time()-t0:.1f}s{tag}")
+
+        # ---- Embedded linear probe ----
+        if cfg.probe_interval > 0 and epoch % cfg.probe_interval == 0:
+            t_probe = time.time()
+            print(f"  -> Running {cfg.probe_epochs}-epoch linear probe at epoch {epoch}...")
+            acc = quick_probe(
+                context_encoder, train_eval_loader, test_loader,
+                d_model=cfg.d_model, n_classes=10,
+                num_epochs=cfg.probe_epochs, lr=1e-3, weight_decay=1e-4,
+                device=device,
+            )
+            history["probe_accs"].append((epoch, acc))
+            # Persist the probe result into the same checkpoint
+            ckpt_state["history"] = history
+            save_atomic(ckpt_state, os.path.join(cfg.ckpt_dir, "pbb_last.pt"))
+            print(f"  [probe ep {epoch:03d}]  test_acc(K_HALF) = {acc:.4f}  "
+                  f"({time.time()-t_probe:.1f}s)")
 
 
 if __name__ == "__main__":
