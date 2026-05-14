@@ -141,7 +141,11 @@ class PBBChunkCIFAR10(Dataset):
             sample.update(self._pack_orderings("pool", pool_ords))
             return sample
         else:
-            ctx_idx = pool[:cfg.k_half]
+            # Test-time context: full pool (40%) if cfg.test_full_pool, else first K_HALF (20%).
+            if getattr(cfg, "test_full_pool", False):
+                ctx_idx = pool                              # all K_POOL = 410 pool pixels
+            else:
+                ctx_idx = pool[:cfg.k_half]                 # first K_HALF = 205 (legacy)
             ctx_pixel_ids = torch.from_numpy(ctx_idx)
             ctx_ords = self._build_orderings(ctx_pixel_ids)
 
