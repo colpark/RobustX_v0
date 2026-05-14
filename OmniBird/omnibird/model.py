@@ -294,11 +294,12 @@ class OmniBirdPredictor(nn.Module):
     """
 
     def __init__(self, d_model=256, d_pred=192, n_layers=4, n_heads=6, dim_head=32,
-                 fourier_dim=96, fourier_scale=15.0, ffn_mult=4,
+                 coord_dim=2, fourier_dim=96, fourier_scale=15.0, ffn_mult=4,
                  pos_symmetric=False):
         super().__init__()
         self.proj_in   = nn.Linear(d_model, d_pred)
-        self.gff       = GaussianFourierFeatures(2, fourier_dim, scale=fourier_scale)
+        # coord_dim=2 for images (y, x); coord_dim=3 for events (x, y, t).
+        self.gff       = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
         self.proj_pos  = nn.Linear(2 * fourier_dim, d_pred)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_pred))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
