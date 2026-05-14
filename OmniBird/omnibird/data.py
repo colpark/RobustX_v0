@@ -154,6 +154,22 @@ class OmniBirdEventDataset(Dataset):
                 forbidden[blk] = True
             tgt_local = np.concatenate(tgt_blocks_local).astype(np.int64)
 
+            # ---- Separation margin (i-JEPA-spirit buffer zone) -------------
+            # If cfg.context_target_margin > 0, every event within that
+            # Euclidean distance of any target event is also forbidden.
+            margin = float(getattr(cfg, "context_target_margin", 0.0))
+            if margin > 0.0 and len(tgt_local) > 0:
+                tgt_coords_real = coords[:N_real][tgt_local]    # (N_tgt_total, 3)
+                m_sq = margin * margin
+                # Chunked broadcast distance to limit peak memory.
+                chunk = 1024
+                for s in range(0, N_real, chunk):
+                    e = min(s + chunk, N_real)
+                    block = coords[s:e].unsqueeze(1)            # (c, 1, D)
+                    d2 = ((block - tgt_coords_real.unsqueeze(0)) ** 2).sum(-1)  # (c, N_tgt)
+                    min_d2 = d2.min(dim=1).values.numpy()
+                    forbidden[s:e] |= (min_d2 < m_sq)
+
             allowed = np.where(~forbidden)[0]
             n_ctx = min(cfg.n_ctx, len(allowed))
             if n_ctx > 0:

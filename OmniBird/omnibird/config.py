@@ -56,6 +56,16 @@ class OmniBirdConfig:
     reinject_pos: bool = False    # input-pos-only by default
     disjoint_targets: bool = True
 
+    # Spatial separation margin (in normalized [-1, 1]^coord_dim units) between
+    # context events and target events. After target blocks are picked, any
+    # event within `context_target_margin` Euclidean distance of ANY target
+    # event is forbidden from the context. Creates a true buffer zone that
+    # forces the predictor to extrapolate across non-trivial spatial extent
+    # rather than interpolate from immediately-adjacent context.
+    #   0.0  -> no margin, only event-level disjointness (legacy default)
+    #   0.03-0.05 -> typical for event clouds in [-1, 1]^3
+    context_target_margin: float = 0.0
+
     # ── JEPA ───────────────────────────────────────────────────────────────
     loss_type: str = "cosine"     # canonical v2 default
     use_centering: bool = False   # canonical i-JEPA: no DINO centering
