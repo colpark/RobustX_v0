@@ -96,25 +96,93 @@ print({k: v.shape if hasattr(v, 'shape') else v for k, v in b.items() if k != 'l
 
 Or open `notebooks/OmniBird_train_synthetic.ipynb` and run top-to-bottom.
 
-## How to run (EventScape, real)
+## How to run (real datasets)
 
-1. Download EventScape from [https://rpg.ifi.uzh.ch/RAMNet.html](https://rpg.ifi.uzh.ch/RAMNet.html).
-2. Convert each clip to the directory layout expected by
-   `datasets/eventscape.py`:
-   ```
-   root/
-     clip_000/
-       events_0.npy        # (N_raw, 4):  x_int, y_int, t_us, polarity ∈ {0,1}
-       label_0.txt         # integer class label
-       rgb_0.png           # optional, for multimodal mode
-       events_1.npy
-       label_1.txt
-       ...
-     clip_001/
-       ...
-   ```
-3. Swap the synthetic dataset for `EventScapeDataset(root, mode="events_only")`
-   in the training notebook.
+We provide automated download + conversion in `datasets/download.py`.
+
+### Option A — EventScape (CARLA driving simulation, the primary target)
+
+Project page: [https://rpg.ifi.uzh.ch/RAMNet.html](https://rpg.ifi.uzh.ch/RAMNet.html).
+Per-Town zips are ~10–50 GB each.
+
+```bash
+cd OmniBird
+
+# 1) List available subsets / URLs
+python -m datasets.download urls
+
+# 2) Download one subset (smallest = Town01_train, recommended first)
+python -m datasets.download eventscape \
+    --out ./data/eventscape_raw \
+    --subsets Town01_train
+
+# 3) (Optional) Add more subsets — they accumulate in ./data/eventscape_raw
+python -m datasets.download eventscape \
+    --out ./data/eventscape_raw \
+    --subsets Town01_validation Town02_train
+
+# 4) Convert raw EventScape (events.h5 + rgb/*.png + semantic/*.png) into
+#    OmniBird's per-clip layout (events_*.npy + label_*.txt + rgb_*.png).
+#    Requires h5py + pillow: pip install h5py pillow
+python -m datasets.download convert_eventscape \
+    --raw ./data/eventscape_raw \
+    --out ./data/eventscape_omnibird
+```
+
+Then in the training notebook, swap the synthetic dataset for:
+```python
+from datasets import EventScapeDataset
+base_train = EventScapeDataset("./data/eventscape_omnibird", mode="events_only")
+```
+
+### Option B — CIFAR10-DVS (small, ~1 GB, fast iteration)
+
+Event-camera recording of CIFAR-10 images, 10-class classification.
+Hosted on Figshare:
+[https://figshare.com/articles/dataset/CIFAR10-DVS_New/4724671](https://figshare.com/articles/dataset/CIFAR10-DVS_New/4724671).
+
+```bash
+cd OmniBird
+
+# 1) Download the raw zips (auto-discovers via Figshare API)
+python -m datasets.download cifar10_dvs --out ./data/cifar10_dvs_raw
+
+# 2) Unzip each archive; you'll get class-named folders containing AEDAT files
+#    (this varies by Figshare version; expected layout below)
+#    raw/
+#      airplane/*.aedat
+#      automobile/*.aedat
+#      ...
+
+# 3) Convert AEDAT → OmniBird per-clip layout
+python -m datasets.download convert_cifar10_dvs \
+    --raw ./data/cifar10_dvs_raw \
+    --out ./data/cifar10_dvs_omnibird
+```
+
+Then use the same `EventScapeDataset` loader on the converted directory:
+```python
+base_train = EventScapeDataset("./data/cifar10_dvs_omnibird", mode="events_only")
+```
+(The loader's format is dataset-agnostic; the converter writes the same layout.)
+
+### Expected per-clip layout (after conversion)
+
+```
+data/<dataset>_omnibird/
+  clip_00000/
+    events_0.npy        # (N_raw, 4): x_int, y_int, t_us, polarity ∈ {0, 1}
+    label_0.txt         # integer class label
+    rgb_0.png           # optional (EventScape only) — paired RGB frame for multimodal
+    events_1.npy
+    label_1.txt
+    ...
+  clip_00001/
+    ...
+```
+
+Each `clip_NNNNN` contains one or more event windows. `EventScapeDataset`
+iterates over every `(events_*.npy, label_*.txt)` pair across all clips.
 
 ## Multimodal Phase 2 — ICMR design
 
