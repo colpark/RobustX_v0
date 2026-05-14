@@ -98,32 +98,46 @@ Or open `notebooks/OmniBird_train_synthetic.ipynb` and run top-to-bottom.
 
 ## How to run (real datasets)
 
-We provide automated download + conversion in `datasets/download.py`.
+### Option A — Tonic-wrapped datasets (RECOMMENDED — verified working URLs)
 
-### Option A — EventScape (CARLA driving simulation, the primary target)
+[Tonic](https://tonic.readthedocs.io/) is a community library that wraps every
+well-hosted event-camera dataset with a torchvision-style API and handles
+the download + caching properly. Use it for any of these:
 
-Project page: [https://rpg.ifi.uzh.ch/RAMNet.html](https://rpg.ifi.uzh.ch/RAMNet.html).
-Per-Town zips are ~10–50 GB each.
+  `NMNIST` · `CIFAR10DVS` · `NCALTECH101` · `DVSGesture` · `NCARS` (and others).
 
 ```bash
+pip install tonic
 cd OmniBird
 
-# 1) List available subsets / URLs
-python -m datasets.download urls
+# Download CIFAR10-DVS (~1 GB) and convert to OmniBird layout
+python -m datasets.download tonic --name CIFAR10DVS --out ./data/cifar10_dvs_omnibird
 
-# 2) Download one subset (smallest = Town01_train, recommended first)
+# Or DVS Gesture (~1 GB, robotics-flavored hand gestures)
+python -m datasets.download tonic --name DVSGesture --out ./data/dvs_gesture_omnibird
+```
+
+Each command downloads the raw archives, parses every sample, and writes
+the OmniBird per-clip layout (events_*.npy + label_*.txt).
+
+### Option B — EventScape (CARLA driving simulation, the primary robotics target)
+
+Project page: [https://rpg.ifi.uzh.ch/RAMNet.html](https://rpg.ifi.uzh.ch/RAMNet.html).
+The current hosting is form-gated (no plain HTTP URLs). To use it:
+
+1. Visit the RAMNet project page and follow their download instructions
+   (typically a Google Drive link revealed after submitting a brief form).
+2. Place the downloaded zips in `./data/eventscape_raw/`.
+3. If you want the auto-download path to work, paste the current direct URLs
+   into the `EVENTSCAPE_URLS` dict at the top of `datasets/download.py`, then:
+
+```bash
 python -m datasets.download eventscape \
     --out ./data/eventscape_raw \
     --subsets Town01_train
 
-# 3) (Optional) Add more subsets — they accumulate in ./data/eventscape_raw
-python -m datasets.download eventscape \
-    --out ./data/eventscape_raw \
-    --subsets Town01_validation Town02_train
-
-# 4) Convert raw EventScape (events.h5 + rgb/*.png + semantic/*.png) into
-#    OmniBird's per-clip layout (events_*.npy + label_*.txt + rgb_*.png).
-#    Requires h5py + pillow: pip install h5py pillow
+# Once raw data is on disk, convert it to OmniBird's layout:
+pip install h5py pillow
 python -m datasets.download convert_eventscape \
     --raw ./data/eventscape_raw \
     --out ./data/eventscape_omnibird

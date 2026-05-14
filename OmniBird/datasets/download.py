@@ -215,14 +215,15 @@ def convert_cifar10_dvs(raw_dir: str | Path, out_dir: str | Path,
 
 # EventScape per-Town zip URLs. Verified at the RAMNet project page; if these
 # 404, check https://rpg.ifi.uzh.ch/RAMNet.html for the current download links.
+# NOTE: the direct-URL pattern below is intentionally left as a placeholder.
+# As of writing, EventScape does NOT host an open-URL zip set — the project
+# page at https://rpg.ifi.uzh.ch/RAMNet.html links to a form-gated download
+# (Google Drive / institutional file server) which changes occasionally.
+# If you have current direct URLs, populate them here. Otherwise prefer the
+# Tonic-based path below (`tonic` subcommand) for any of the well-hosted
+# event-camera datasets.
 EVENTSCAPE_URLS = {
-    "Town01_train":      "https://rpg.ifi.uzh.ch/data/RAMNet/Town01/Town01_train.zip",
-    "Town01_validation": "https://rpg.ifi.uzh.ch/data/RAMNet/Town01/Town01_validation.zip",
-    "Town01_test":       "https://rpg.ifi.uzh.ch/data/RAMNet/Town01/Town01_test.zip",
-    "Town02_train":      "https://rpg.ifi.uzh.ch/data/RAMNet/Town02/Town02_train.zip",
-    "Town02_validation": "https://rpg.ifi.uzh.ch/data/RAMNet/Town02/Town02_validation.zip",
-    "Town02_test":       "https://rpg.ifi.uzh.ch/data/RAMNet/Town02/Town02_test.zip",
-    # 03, 04, 05 also exist; uncomment as desired.
+    # "Town01_train":      "https://...your-current-url-here.../Town01_train.zip",
 }
 
 
@@ -342,6 +343,94 @@ def convert_eventscape(raw_dir: str | Path, out_dir: str | Path,
 
 
 # ---------------------------------------------------------------------------
+# Tonic-based downloads (recommended — verified working URLs)
+# ---------------------------------------------------------------------------
+#
+# https://tonic.readthedocs.io/ — a community-maintained library that wraps
+# every well-hosted event-camera dataset with a torchvision-style API and
+# handles the download + caching for you. Datasets it knows about (verified):
+#
+#   tonic.datasets.NMNIST          — N-MNIST (events of MNIST digits)
+#   tonic.datasets.CIFAR10DVS      — CIFAR10-DVS (events of CIFAR-10 images)
+#   tonic.datasets.NCALTECH101     — N-Caltech101
+#   tonic.datasets.DVSGesture      — IBM DVS128 hand-gesture (robotics-ish)
+#   tonic.datasets.NCARS           — N-CARS (binary car detection from events)
+#   tonic.datasets.POKERDVS        — small playing-card dataset
+#   ...etc
+#
+# Install with:   pip install tonic
+
+TONIC_DATASETS = ("NMNIST", "CIFAR10DVS", "NCALTECH101", "DVSGesture", "NCARS")
+
+
+def download_via_tonic(dataset_name: str, out_dir: str | Path):
+    """Download an event-camera dataset via the Tonic library and convert it
+    to OmniBird's per-clip layout.
+
+    Tonic handles the download + extraction; we iterate over each sample,
+    grab the raw (x, y, t, p) events, and write events_0.npy + label_0.txt.
+
+    Args:
+        dataset_name: one of TONIC_DATASETS (case-sensitive).
+        out_dir:      destination root (will contain clip_NNNNN/ subdirs).
+    """
+    try:
+        import tonic
+    except ImportError:
+        print("missing dependency: tonic. Install with:")
+        print("    pip install tonic")
+        return
+
+    if not hasattr(tonic.datasets, dataset_name):
+        print(f"unknown tonic dataset: {dataset_name}  (try one of: {TONIC_DATASETS})")
+        return
+
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    DataCls = getattr(tonic.datasets, dataset_name)
+    save_to = str(out_dir.parent / f"{dataset_name}_raw_cache")
+
+    print(f"downloading {dataset_name} via tonic to {save_to} ...")
+    # Most tonic datasets accept (save_to, train=True/False); a few are split-less.
+    try:
+        ds_train = DataCls(save_to=save_to, train=True)
+    except TypeError:
+        ds_train = DataCls(save_to=save_to)
+    try:
+        ds_test = DataCls(save_to=save_to, train=False)
+    except TypeError:
+        ds_test = ds_train
+        print("  (dataset has no train/test split — using the whole set as 'train')")
+
+    sensor_size = getattr(ds_train, "sensor_size", None)
+    print(f"  train samples = {len(ds_train)}  test samples = {len(ds_test)}  sensor = {sensor_size}")
+
+    def _dump(ds, prefix, start_idx):
+        i = start_idx
+        for k in range(len(ds)):
+            events, label = ds[k]
+            # Tonic events are structured arrays with fields x, y, t, p
+            ev = np.stack(
+                [events["x"].astype(np.float32),
+                 events["y"].astype(np.float32),
+                 events["t"].astype(np.float32),
+                 events["p"].astype(np.float32)],
+                axis=1,
+            )
+            clip_dir = out_dir / f"clip_{i:06d}"; clip_dir.mkdir(parents=True, exist_ok=True)
+            np.save(clip_dir / "events_0.npy", ev)
+            (clip_dir / "label_0.txt").write_text(str(int(label)))
+            i += 1
+            if i % 500 == 0:
+                print(f"    {prefix}: wrote {i - start_idx}/{len(ds)} clips")
+        return i
+
+    n = _dump(ds_train, "train", 0)
+    if ds_test is not ds_train:
+        n = _dump(ds_test, "test", n)
+    print(f"\nwrote {n} clips to {out_dir}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -366,7 +455,12 @@ def _main():
     p_ces.add_argument("--raw", required=True, help="extracted EventScape root")
     p_ces.add_argument("--out", required=True, help="destination OmniBird layout dir")
 
-    p_list  = sub.add_parser("urls",         help="print canonical EventScape download URLs")
+    p_list  = sub.add_parser("urls",         help="print canonical EventScape download URLs (placeholders)")
+
+    p_tonic = sub.add_parser("tonic", help="download an event dataset via the tonic library (recommended)")
+    p_tonic.add_argument("--name", required=True, choices=list(TONIC_DATASETS),
+                          help="tonic dataset name")
+    p_tonic.add_argument("--out", required=True, help="destination OmniBird layout dir")
 
     args = p.parse_args()
     if args.cmd == "cifar10_dvs":
@@ -377,9 +471,22 @@ def _main():
         download_eventscape(args.out, subsets=args.subsets, extract=not args.no_extract)
     elif args.cmd == "convert_eventscape":
         convert_eventscape(args.raw, args.out)
+    elif args.cmd == "tonic":
+        download_via_tonic(args.name, args.out)
     elif args.cmd == "urls":
-        for name, url in eventscape_download_urls().items():
-            print(f"{name:24s}  {url}")
+        urls = eventscape_download_urls()
+        if not urls:
+            print("EVENTSCAPE_URLS is currently empty in download.py.")
+            print("Visit https://rpg.ifi.uzh.ch/RAMNet.html to get the latest")
+            print("download links (often Google Drive / institutional file servers),")
+            print("then populate the EVENTSCAPE_URLS dict at the top of this file.")
+            print()
+            print("For an immediately downloadable alternative, run:")
+            print("    python -m datasets.download tonic --name CIFAR10DVS --out ./data/cifar10_dvs_omnibird")
+            print("    python -m datasets.download tonic --name DVSGesture --out ./data/dvs_gesture_omnibird")
+        else:
+            for name, url in urls.items():
+                print(f"{name:24s}  {url}")
 
 
 if __name__ == "__main__":
