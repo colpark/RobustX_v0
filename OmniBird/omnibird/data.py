@@ -387,7 +387,18 @@ class OmniBirdPatchDataset(Dataset):
                 blk = np.argsort(d2, kind="stable")[:self.patches_per_block]
                 tgt_blocks.append(blk)
                 forbidden[blk] = True
-            tgt_idx = np.concatenate(tgt_blocks).astype(np.int64)         # (P_tgt,)
+            if tgt_blocks:
+                tgt_idx = np.concatenate(tgt_blocks).astype(np.int64)
+            else:
+                tgt_idx = np.array([], dtype=np.int64)
+            # Pad tgt_idx to fixed size so DataLoader can collate variable-density
+            # samples (clips with few events may fit fewer than n_pred_blocks).
+            expected_tgt = self.n_pred_blocks * self.patches_per_block
+            if len(tgt_idx) < expected_tgt:
+                fill_val = int(tgt_idx[-1]) if len(tgt_idx) else 0
+                fill = np.full(expected_tgt - len(tgt_idx), fill_val,
+                                dtype=np.int64)
+                tgt_idx = np.concatenate([tgt_idx, fill]) if len(tgt_idx) else fill
 
             # Optional spatial margin in centroid space
             if self.margin > 0 and len(tgt_idx) > 0:
