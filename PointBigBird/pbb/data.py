@@ -89,12 +89,23 @@ class PBBChunkCIFAR10(Dataset):
 
         if self.train:
             rng = np.random.RandomState()
+            disjoint_targets = getattr(cfg, "disjoint_targets", False)
+
             # --- v8 multi-block masking ---
             forbidden = np.zeros(cfg.k_pool, dtype=bool)
             tgt_blocks_local = []
             for _ in range(cfg.n_pred):
-                a = rng.randint(cfg.k_pool)
-                d2 = (pool_xy - pool_xy[a]).pow(2).sum(-1).numpy()
+                if disjoint_targets:
+                    # Sample anchor from positions NOT yet in any target block,
+                    # and restrict the k-nearest search to those positions too.
+                    allowed_now = np.where(~forbidden)[0]
+                    a_pos_in_allowed = rng.randint(len(allowed_now))
+                    a = allowed_now[a_pos_in_allowed]
+                    d2 = (pool_xy - pool_xy[a]).pow(2).sum(-1).numpy()
+                    d2[forbidden] = np.inf
+                else:
+                    a = rng.randint(cfg.k_pool)
+                    d2 = (pool_xy - pool_xy[a]).pow(2).sum(-1).numpy()
                 blk = np.argsort(d2, kind="stable")[:cfg.k_tgt]
                 tgt_blocks_local.append(blk)
                 forbidden[blk] = True

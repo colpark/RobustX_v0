@@ -17,7 +17,7 @@ from .jepa import (
     ema_update, make_momentum_schedule, TargetCenter,
     gather_target_features, jepa_loss, diag_dict, fmt_diag,
 )
-from .probe import LinearProbe, extract_z, quick_probe
+from .probe import LinearProbe, AttnPoolHead, extract_z, quick_probe
 from .utils import save_atomic, ensure_dir, count_params, short_params
 
 __all__ = [
@@ -36,7 +36,7 @@ __all__ = [
     "ema_update", "make_momentum_schedule", "TargetCenter",
     "gather_target_features", "jepa_loss", "diag_dict", "fmt_diag",
     # probe
-    "LinearProbe", "extract_z", "quick_probe",
+    "LinearProbe", "AttnPoolHead", "extract_z", "quick_probe",
     # utils
     "save_atomic", "ensure_dir", "count_params", "short_params",
 ]

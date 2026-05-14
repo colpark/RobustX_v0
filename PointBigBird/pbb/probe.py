@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 
 from .data import orderings_from_batch
@@ -15,6 +16,40 @@ class LinearProbe(nn.Module):
 
     def forward(self, z):
         return self.fc(z)
+
+
+class AttnPoolHead(nn.Module):
+    """Attention-pool head: a learnable query Q ∈ ℝᴰ cross-attends to the
+    encoder's per-token features g ∈ ℝᴮˣᴷˣᴰ and returns one D-dim feature
+    z ∈ ℝᴮˣᴰ. Used as a more expressive alternative to `g.mean(dim=1)` for
+    linear probing without retraining the encoder.
+    """
+
+    def __init__(self, dim, n_heads=4, dim_head=64):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.query  = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.to_q  = nn.Linear(dim, inner, bias=False)
+        self.to_kv = nn.Linear(dim, inner * 2, bias=False)
+        self.to_out = nn.Linear(inner, dim)
+
+    def forward(self, g):
+        B, K, D = g.shape
+        q  = self.to_q(self.norm_q(self.query.expand(B, -1, -1)))         # (B, 1, inner)
+        kv = self.to_kv(self.norm_kv(g))                                  # (B, K, 2*inner)
+        k, v = kv.chunk(2, dim=-1)
+        q = q.view(B, 1, self.heads, self.dim_head).transpose(1, 2)       # (B, H, 1, Dh)
+        k = k.view(B, K, self.heads, self.dim_head).transpose(1, 2)       # (B, H, K, Dh)
+        v = v.view(B, K, self.heads, self.dim_head).transpose(1, 2)
+        scores = (q @ k.transpose(-2, -1)) * self.scale                   # (B, H, 1, K)
+        attn = scores.softmax(dim=-1)
+        out  = (attn @ v).transpose(1, 2).contiguous().view(B, 1, -1)     # (B, 1, inner)
+        return self.to_out(out).squeeze(1)                                # (B, D)
 
 
 def _move_ords(ords, device):
@@ -32,6 +67,13 @@ def extract_z(context_encoder, pixels, coords, orderings):
     return g.mean(dim=1)
 
 
+@torch.no_grad()
+def _encode_g(context_encoder, pixels, coords, orderings):
+    """Forward through the (frozen) encoder, return per-token features `g`."""
+    context_encoder.eval()
+    return context_encoder(pixels, coords, orderings)
+
+
 def quick_probe(
     context_encoder: nn.Module,
     train_eval_loader,
@@ -42,47 +84,68 @@ def quick_probe(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     device: str = "cpu",
+    use_attn_pool: bool = False,
+    attn_pool_heads: int = 4,
+    attn_pool_dim_head: int = 64,
 ):
-    """Train a fresh `LinearProbe` on top of the frozen `context_encoder` for
+    """Train a fresh probe head on top of the frozen `context_encoder` for
     `num_epochs` epochs through `train_eval_loader`, then report test accuracy
     on `test_loader`.
 
-    Saves and restores the encoder's `requires_grad` flags and `training` mode,
-    so calling this mid-training does not perturb the JEPA pre-training state.
+    - `use_attn_pool=False` (default): probe = `LinearProbe` on `g.mean(dim=1)`.
+    - `use_attn_pool=True`           : probe = `AttnPoolHead(g) → LinearProbe`,
+                                       trains both head and classifier together.
+
+    The encoder is always frozen. `requires_grad` flags and `training` mode are
+    saved and restored, so calling this mid-training does not perturb the JEPA
+    pre-training state.
     """
     saved_train = context_encoder.training
     saved_rg    = [p.requires_grad for p in context_encoder.parameters()]
     for p in context_encoder.parameters():
         p.requires_grad_(False)
 
-    probe = LinearProbe(in_dim=d_model, n_classes=n_classes).to(device)
-    opt   = AdamW(probe.parameters(), lr=lr, weight_decay=weight_decay)
-    ce    = nn.CrossEntropyLoss()
+    classifier = LinearProbe(in_dim=d_model, n_classes=n_classes).to(device)
+    if use_attn_pool:
+        pool = AttnPoolHead(d_model, n_heads=attn_pool_heads,
+                            dim_head=attn_pool_dim_head).to(device)
+        trainables = list(pool.parameters()) + list(classifier.parameters())
+    else:
+        pool = None
+        trainables = list(classifier.parameters())
+
+    opt = AdamW(trainables, lr=lr, weight_decay=weight_decay)
+    ce  = nn.CrossEntropyLoss()
+
+    def _z_from_batch(b):
+        ctx_p = b["ctx_pixels"].to(device)
+        ctx_c = b["ctx_coords"].to(device)
+        ctx_o = _move_ords(orderings_from_batch(b, "ctx"), device)
+        g = _encode_g(context_encoder, ctx_p, ctx_c, ctx_o)            # (B, K, D)
+        if pool is not None:
+            return pool(g)                                              # (B, D)
+        return g.mean(dim=1)                                            # (B, D)
 
     for _ in range(num_epochs):
-        probe.train()
+        classifier.train()
+        if pool is not None: pool.train()
         for b in train_eval_loader:
-            ctx_p = b["ctx_pixels"].to(device)
-            ctx_c = b["ctx_coords"].to(device)
-            ctx_o = _move_ords(orderings_from_batch(b, "ctx"), device)
             y = b["label"].to(device)
-            z = extract_z(context_encoder, ctx_p, ctx_c, ctx_o)
-            logits = probe(z)
+            z = _z_from_batch(b)
+            logits = classifier(z)
             loss = ce(logits, y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
-    probe.eval()
+    classifier.eval()
+    if pool is not None: pool.eval()
     correct = total = 0
     with torch.no_grad():
         for b in test_loader:
-            ctx_p = b["ctx_pixels"].to(device)
-            ctx_c = b["ctx_coords"].to(device)
-            ctx_o = _move_ords(orderings_from_batch(b, "ctx"), device)
             y = b["label"].to(device)
-            z = extract_z(context_encoder, ctx_p, ctx_c, ctx_o)
-            correct += (probe(z).argmax(-1) == y).sum().item()
+            z = _z_from_batch(b)
+            correct += (classifier(z).argmax(-1) == y).sum().item()
             total   += y.size(0)
     acc = correct / max(total, 1)
 

@@ -253,10 +253,16 @@ class PredictorBlock(nn.Module):
 class PBBPredictor(nn.Module):
     """Dense Transformer that takes encoder context tokens + mask tokens at
     target coordinates and predicts target features.
+
+    If `pos_symmetric=True`, the predictor expects `ctx_coords` to be passed
+    along with `ctx_feat`, and adds `proj_pos(γ(ctx_coords))` to the context
+    tokens so that both context and target tokens carry explicit positional
+    information (matches i-JEPA's predictor more faithfully).
     """
 
     def __init__(self, d_model=256, d_pred=192, n_layers=4, n_heads=6, dim_head=32,
-                 fourier_dim=96, fourier_scale=15.0, ffn_mult=4):
+                 fourier_dim=96, fourier_scale=15.0, ffn_mult=4,
+                 pos_symmetric=False):
         super().__init__()
         self.proj_in   = nn.Linear(d_model, d_pred)
         self.gff       = GaussianFourierFeatures(2, fourier_dim, scale=fourier_scale)
@@ -269,16 +275,21 @@ class PBBPredictor(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_pred)
         self.proj_out = nn.Linear(d_pred, d_model)
+        self.pos_symmetric = pos_symmetric
 
-    def forward(self, ctx_feat, target_coords):
+    def forward(self, ctx_feat, target_coords, ctx_coords=None):
         """
         ctx_feat:      (B, K_ctx, D_model)
         target_coords: (B, N_tgt, 2)
+        ctx_coords:    (B, K_ctx, 2)  — required if `pos_symmetric=True`
         Returns: h_pred (B, N_tgt, D_model)
         """
         B, K, _ = ctx_feat.shape
-        Nq = target_coords.shape[1]
         ctx_tok = self.proj_in(ctx_feat)                          # (B, K, D_pred)
+        if self.pos_symmetric:
+            assert ctx_coords is not None, \
+                "pos_symmetric=True requires ctx_coords to be passed"
+            ctx_tok = ctx_tok + self.proj_pos(self.gff(ctx_coords))
         tgt_tok = self.proj_pos(self.gff(target_coords)) + self.mask_token  # (B, Nq, D_pred)
         x = torch.cat([ctx_tok, tgt_tok], dim=1)
         for blk in self.blocks:

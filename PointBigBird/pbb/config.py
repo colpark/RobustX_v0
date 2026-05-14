@@ -55,6 +55,14 @@ class PBBConfig:
     # sequence position, which changes with the curve).
     reinject_pos: bool = True
 
+    # v2 improvements (default OFF for back-compat — toggled on in the v2 notebook):
+    # - disjoint_targets:           target blocks disjoint from each other (not just from ctx)
+    # - predictor_pos_symmetric:    predictor adds γ(ctx_coords) to ctx tokens too
+    # - probe_use_attn_pool:        probe pools via a learnable AttnPoolHead instead of mean
+    disjoint_targets: bool = False
+    predictor_pos_symmetric: bool = False
+    probe_use_attn_pool: bool = False
+
     # JEPA
     ema_start: float = 0.999
     ema_end: float = 1.000
