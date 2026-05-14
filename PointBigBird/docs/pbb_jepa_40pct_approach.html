@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PointBigBird-JEPA — sparse-input (40 %) approach</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1f1f23;
+    --muted: #5a5a66;
+    --rule: #e2e2e6;
+    --code-bg: #f1f1f4;
+    --accent: #2c5cdc;
+    --accent-soft: #eaf0ff;
+    --warn: #b8480d;
+    --warn-soft: #fff1e6;
+    --ok: #1f7a3a;
+    --ok-soft: #eaf6ee;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+    line-height: 1.55;
+    font-size: 16px;
+  }
+  .container {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 56px 28px 96px;
+  }
+  header { margin-bottom: 32px; border-bottom: 1px solid var(--rule); padding-bottom: 24px; }
+  h1 { font-size: 30px; margin: 0 0 8px; line-height: 1.2; }
+  h2 { font-size: 22px; margin: 48px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+  h3 { font-size: 17px; margin: 28px 0 10px; color: var(--muted); font-weight: 600; }
+  h1 .subtitle { display: block; font-size: 16px; font-weight: 400; color: var(--muted); margin-top: 6px; }
+  p { margin: 0 0 14px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 13.5px; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 6px;
+    overflow-x: auto;
+    line-height: 1.45;
+    margin: 0 0 16px;
+  }
+  pre code { background: none; padding: 0; }
+  .note {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px;
+    margin: 14px 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .warn {
+    background: var(--warn-soft);
+    border-left: 3px solid var(--warn);
+    padding: 12px 16px;
+    margin: 14px 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .ok {
+    background: var(--ok-soft);
+    border-left: 3px solid var(--ok);
+    padding: 12px 16px;
+    margin: 14px 0;
+    border-radius: 0 4px 4px 0;
+  }
+  table {
+    border-collapse: collapse;
+    margin: 12px 0 24px;
+    width: 100%;
+    font-size: 14.5px;
+  }
+  th, td {
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--rule);
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); font-weight: 600; }
+  td code { font-size: 12.5px; }
+  ul, ol { padding-left: 22px; margin: 8px 0 16px; }
+  li { margin: 4px 0; }
+  .toc { font-size: 14.5px; background: #fff; border: 1px solid var(--rule); border-radius: 6px; padding: 16px 22px; margin-bottom: 32px; }
+  .toc ol { margin: 0; padding-left: 22px; }
+  .toc li { margin: 2px 0; }
+  .meta { color: var(--muted); font-size: 14px; }
+  .diagram { background: #fff; border: 1px solid var(--rule); border-radius: 6px; padding: 14px 18px; font-size: 13px; line-height: 1.4; overflow-x: auto; margin: 14px 0; }
+  .pill { display: inline-block; background: var(--accent-soft); color: var(--accent); padding: 1px 8px; border-radius: 999px; font-size: 12.5px; font-weight: 600; margin-right: 6px; }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 32px 0; }
+  .small { font-size: 13.5px; color: var(--muted); }
+  footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 13.5px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>
+    PointBigBird-JEPA
+    <span class="subtitle">Sparse-input self-supervised pretraining on CIFAR-10 — the 40 % approach</span>
+  </h1>
+  <p class="meta">
+    A per-token transformer with space-filling-curve serialization and BigBird block-sparse attention,
+    trained with an i-JEPA-style joint-embedding predictive objective on a fixed 40 % per-image data budget.
+  </p>
+</header>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#problem">The problem: sparse-input SSL</a></li>
+    <li><a href="#data">Data budget and multi-block masking</a></li>
+    <li><a href="#tokenization">Tokenization</a></li>
+    <li><a href="#encoder">Encoder: serialization + BigBird</a></li>
+    <li><a href="#predictor">Predictor</a></li>
+    <li><a href="#loss">Loss, EMA target, and centering</a></li>
+    <li><a href="#v2">Architectural improvements (v2)</a></li>
+    <li><a href="#degrade">Anti-degradation mitigations</a></li>
+    <li><a href="#eval">Evaluation: linear probing</a></li>
+    <li><a href="#summary">Recipe at a glance</a></li>
+  </ol>
+</div>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="problem">1. The problem: sparse-input self-supervised learning</h2>
+
+<p>
+Each CIFAR-10 image has 32 × 32 = 1024 pixels. We impose a hard constraint:
+<strong>only a fixed 40 % subset (410 pixels) is ever available per image</strong>
+— at any phase of training or testing. The model never sees the other 60 % of any image.
+</p>
+
+<p>
+This is a stand-in for sparse-input regimes that arise in scientific data
+(point clouds, masked images, sensor networks, sparse-view reconstruction).
+We want to know whether self-supervised pretraining can produce features
+that classify well under this constraint — and we want an architecture
+that handles sparse, irregular inputs natively rather than being shoe-horned
+from a dense-grid design.
+</p>
+
+<div class="note">
+  <strong>Why this is hard:</strong> humans struggle to recognize CIFAR-10 classes at 20 %
+  pixel density. Information-theoretically, a lot of detail is gone. A "good" linear-probe
+  result on 20-40 % sparse views sits in the <strong>65–75 %</strong> band, with an
+  estimated ceiling around <strong>85 %</strong> (what a strong supervised model trained
+  on 40 % sparse views could achieve).
+</div>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="data">2. Data budget and multi-block masking</h2>
+
+<p>The data pipeline has two tiers of randomness.</p>
+
+<h3>Tier 1 — the 40 % pool, fixed per image</h3>
+<pre><code># Determined once per image with a global seed (pool_seed = 12345)
+rng = np.random.RandomState(pool_seed)
+pool_idx = rng.permutation(1024)[:410]   # 410 pixel indices, identical at every epoch</code></pre>
+<p>
+  Image #7's pool is exactly the same 410 pixels at every iteration of training,
+  every probe call, every test pass. This is the "data budget" — that's all there is.
+</p>
+
+<h3>Tier 2 — context and target blocks, resampled each training step</h3>
+<p>
+We follow i-JEPA's <code>MaskCollator</code> recipe (multi-block masking with
+disjoint targets), adapted for the pool constraint:
+</p>
+<ol>
+  <li>Sample <code>N_PRED = 4</code> target anchors uniformly from the 410-pool;
+    each anchor's <code>K_TGT = 50</code> nearest pool pixels form a contiguous target block.
+    With <span class="mono">disjoint_targets=True</span>, anchors avoid positions already in earlier target blocks.</li>
+  <li>Build <code>forbidden = ⋃ target_blocks</code>.</li>
+  <li>Sample one context anchor from <code>pool \ forbidden</code>; take its <code>K_CTX = 100</code> nearest neighbors
+    within the allowed region as the context block.</li>
+</ol>
+
+<div class="diagram">
+<pre><code>full image (1024 px)
+  └── 40% pool (410 px, fixed per image)         ← all training data
+        ├── 4 target blocks (200 positions total, contiguous, disjoint from each other)
+        ├── 1 context block (100 px, contiguous, disjoint from targets)
+        └── ~110 slack pool pixels (unused this iteration)</code></pre>
+</div>
+
+<p>
+Disjointness <code>context ∩ targets = ∅</code> is invariant by construction
+(this was the v8 fix that broke the 0.85 plateau in earlier OmniField-JEPA runs:
+previously target positions could fall <em>inside</em> the context, making the
+predictor's job a retrieval task instead of a prediction task).
+</p>
+
+<h3>Test-time contract</h3>
+<p>
+At test/probe time we serve the full <code>K_POOL = 410</code> pool (all 40 %) deterministically.
+Earlier versions served only the first <code>K_HALF = 205</code> ("legacy 20 %" contract);
+the v2 setup defaults to <code>k_test = 410</code> via <code>cfg.test_full_pool = True</code>.
+</p>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="tokenization">3. Tokenization</h2>
+
+<p>Each visible point becomes a single <code>D_model = 256</code>-dim token:</p>
+<pre><code>token<sub>n</sub> = W<sub>signal</sub> · rgb<sub>n</sub>  +  W<sub>pos</sub> · γ(coord<sub>n</sub>)</code></pre>
+
+<p>
+where <code>γ(c) = [sin(B·c), cos(B·c)]</code> are Gaussian Fourier features with
+<code>B ∈ ℝ²×⁹⁶</code> fixed-random (<code>scale = 15</code>). Both the signal projection
+<code>W_signal</code> and the positional projection <code>W_pos</code> map into the same
+<code>D_model</code>-dim space, so token = content + position, added.
+</p>
+
+<div class="note">
+  <strong>Why positional embedding is critical here:</strong> the architecture re-orders tokens
+  along different curves at every layer (see <a href="#encoder">§4</a>), so <em>sequence position</em>
+  is uninformative — it means different things at each layer. The model can only identify
+  "where am I in space?" by reading <code>γ(coord)</code>. Position information is decoupled
+  from sequence order by design.
+</div>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="encoder">4. Encoder: space-filling curves + BigBird block-sparse attention</h2>
+
+<p>
+The encoder is a stack of <code>L = 6</code> Transformer-style blocks. Each block has three
+non-standard moves on top of the usual (LayerNorm → self-attention → FFN):
+</p>
+
+<h3>4a. Per-layer random serialization</h3>
+<p>
+For each block, we sample one ordering uniformly from
+<code>{z-order, z-order-reversed, Hilbert, Hilbert-reversed}</code> and reorder the token
+sequence accordingly. After the attention + FFN, we reorder back.
+</p>
+
+<p>
+Curves are global functions of the 32 × 32 grid; they are precomputed once at module load.
+For a specific sample with K visible pool pixels, the per-sample sequence is just
+<code>argsort(global_rank[visible_pixel_ids])</code> — O(K log K). No per-sample curve
+re-walking, no learned parameters.
+</p>
+
+<pre><code># pbb/serialization.py
+def subset_perm(subset_pixel_ids, full_rank):
+    ranks = full_rank[subset_pixel_ids]    # look up each visible pixel's curve rank
+    return torch.argsort(ranks)            # sort the subset by rank</code></pre>
+
+<div class="note">
+  <strong>Locality:</strong> Hilbert is locality-preserving (consecutive curve positions are L1-adjacent
+  in image space), so adjacent visible pixels along the curve are typically spatial neighbors.
+  Z-order is weaker but has different locality structure. Reverses provide two more
+  distinct sequence neighborhoods. Across layers, every pixel gets to "see" its spatial
+  neighborhood under multiple 1-D slices.
+</div>
+
+<h3>4b. BigBird block-sparse self-attention</h3>
+<p>
+Within the chosen ordering, the sequence is split into blocks of <code>block_size = 8</code>.
+Each query block attends to:
+</p>
+<ul>
+  <li><code>(2·window + 1) = 3</code> window blocks (self + left + right).</li>
+  <li><code>n_global = 2</code> "global" blocks (first and last in the sequence).</li>
+  <li><code>n_random = 2</code> blocks sampled uniformly per forward pass.</li>
+</ul>
+<p>Total: 7 attended blocks per query block, regardless of sequence length.</p>
+
+<table>
+<tr><th>Sequence</th><th>N blocks</th><th>Sparsity (attended / total)</th></tr>
+<tr><td>Train context (K_CTX = 100, padded to 104)</td><td>13</td><td>7/13 ≈ 54 %</td></tr>
+<tr><td>Probe / test (K_TEST = 410, padded to 416)</td><td>52</td><td>7/52 ≈ 13 %</td></tr>
+<tr><td>Target encoder (K_POOL = 410, padded to 416)</td><td>52</td><td>7/52 ≈ 13 %</td></tr>
+</table>
+
+<p>
+Implementation is pure PyTorch via <code>index_select</code>/<code>gather</code> on the
+block dimension. No custom CUDA kernels. The implementation is verified to be equivalent
+to dense multi-head attention when configured for full-pattern coverage (<code>BigBirdSparseAttention(equivalent_to_dense=True)</code> matches plain MHA to <code>max|Δ| &lt; 1e-5</code>).
+</p>
+
+<h3>4c. Positional re-injection (off by default in v2)</h3>
+<p>
+A subtle but important point: each block can optionally re-inject the positional embedding as a residual
+right before attention:
+</p>
+<pre><code>def forward(self, x, perm, inverse_perm, pos_emb, ...):
+    if pos_emb is not None:        # cfg.reinject_pos
+        x = x + pos_emb            # ensure every layer has access to true (y, x)
+    x_p = gather(x, perm)
+    x_p = x_p + attn(LN(x_p))
+    x_p = x_p + ffn(LN(x_p))
+    return gather(x_p, inverse_perm)</code></pre>
+<p>
+Without re-injection, the input-stage positional information dilutes through deep layers,
+and the per-layer reshuffling can't motivate the model to attend to true position (sequence
+position is meaningless under randomization). The v2 + input-pos-only variant
+turns re-injection OFF and accepts the trade-off; an ablation toggle is provided.
+</p>
+
+<div class="diagram">
+<pre><code>┌── 6 × EncoderBlock ────────────────────────────────────────────────┐
+│                                                                    │
+│   for each layer ℓ ∈ 1..6:                                          │
+│     pick ordering π_ℓ ∈ {z, z_rev, hilbert, hilbert_rev}            │
+│     x' = gather(x, π_ℓ)                                             │
+│     [optional: x' = x' + pos_emb]                                   │
+│     x' = x' + BigBirdSparseAttn(LayerNorm(x'))                      │
+│     x' = x' + FFN(LayerNorm(x'))                                    │
+│     x  = gather(x', π_ℓ⁻¹)        ← back to canonical order          │
+│                                                                    │
+└─→ g (B, K, D_model)                                                 │</code></pre>
+</div>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="predictor">5. Predictor</h2>
+
+<p>
+A small 4-layer dense Transformer (no BigBird, no serialization) that takes the
+context encoder's per-token features and predicts the target encoder's features
+at the 200 target coordinates.
+</p>
+
+<pre><code># pbb/model.py PBBPredictor.forward
+ctx_tok = proj_g(g_ctx)                              # (B, K_ctx, D_pred)
+if pos_symmetric:                                     # v2 #2
+    ctx_tok = ctx_tok + proj_pos(γ(ctx_coords))
+tgt_tok = proj_pos(γ(target_coords)) + mask_token    # (B, N_tgt, D_pred)
+x = concat([ctx_tok, tgt_tok])
+for blk in 4 × PredictorBlock:                        # dense MHA + FFN
+    x = blk(x)
+h_pred = proj_out(LayerNorm(x[K_ctx:]))               # take target slice → D_model</code></pre>
+
+<div class="note">
+  <strong>Positional symmetry (v2 fix #2):</strong> the original i-JEPA gives positional information
+  to <em>both</em> the context and target tokens of the predictor. Earlier versions of this code
+  only added γ(coord) to the target tokens, forcing the predictor to infer "where in space"
+  each <code>g_ctx</code> token came from purely from its content. The v2 fix passes
+  <code>ctx_coords</code> through and adds γ(ctx_coords) to <code>ctx_tok</code> too. Shares
+  <code>proj_pos</code> with the target side, no new parameters.
+</div>
+
+<h3>Target features — direct gather, not soft-pool</h3>
+<p>
+By construction, <code>target_coords ⊂ pool_coords</code>, so the target encoder's per-token
+features <em>directly contain</em> the features at each target position. We gather them:
+</p>
+<pre><code># pbb/jepa.py
+h_tgt_raw = gather(g_tgt, tgt_pool_pos)              # (B, N_tgt, D_model)
+h_tgt     = LayerNorm(h_tgt_raw)                      # cfg.use_centering=False (canonical i-JEPA)</code></pre>
+<p>
+No learnable parameters on the target side. Earlier versions of this code (OmniField-JEPA v1–v8)
+used a <em>deterministic Gaussian soft-pool</em> because the latent set didn't correspond
+1-to-1 with input points; with the per-token PointBigBird architecture, direct gather is correct
+and simpler.
+</p>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="loss">6. Loss, EMA target, and centering</h2>
+
+<h3>Loss</h3>
+<p>Two options, toggled by <code>cfg.loss_type</code>:</p>
+<pre><code>loss = F.smooth_l1_loss(h_pred, h_tgt)                          # "smooth_l1" (legacy)
+loss = (1 - F.cosine_similarity(h_pred, h_tgt, dim=-1)).mean()  # "cosine" (v2 default)</code></pre>
+<p>
+Cosine is direction-only — it doesn't pull <code>‖h_pred‖</code> toward <code>‖h_tgt‖</code>.
+Over long training, smooth-L1's magnitude pressure tends to eat capacity that should go to
+discriminative directions, so v2 switches to cosine.
+</p>
+
+<h3>EMA target encoder</h3>
+<pre><code>m = ema_start (0.999) → ema_end (0.9999) linearly over total steps
+for p_q, p_k in zip(context_encoder.parameters(), target_encoder.parameters()):
+    p_k.data.mul_(m).add_((1 - m) * p_q.detach())</code></pre>
+<p>
+The target encoder is the EMA-smoothed shadow of the context encoder, frozen w.r.t. gradients.
+v2 caps <code>ema_end</code> at <code>0.9999</code> instead of <code>1.000</code> so the target
+keeps moving forever — avoids the "predictor saturation" failure mode where features drift
+after the target encoder freezes.
+</p>
+
+<h3>Centering — dropped in v2</h3>
+<p>
+DINO-style centering (running EMA of the per-feature mean, subtracted from the target)
+is <em>not</em> part of the canonical i-JEPA recipe. It was carried over from v1–v8 of the
+OmniField-JEPA line. Dropped in v2:
+</p>
+<pre><code># cfg.use_centering = False  (new default)
+h_tgt = F.layer_norm(h_tgt_raw, (h_tgt_raw.size(-1),))     # no center subtraction</code></pre>
+<p>
+With centering off, we rely on the canonical i-JEPA anti-collapse stack:
+EMA target encoder + asymmetric masking + multi-block targets + LayerNorm of <code>h_tgt</code>.
+</p>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="v2">7. Architectural improvements (v2)</h2>
+
+<p>The v2 setup turns on five named improvements over the earlier sparse-input baseline:</p>
+<table>
+<tr><th>#</th><th>Change</th><th>Toggle</th></tr>
+<tr><td>1</td><td>BigBird becomes genuinely sparse: <code>block_size = 8</code> (was 32, which made it equivalent to dense at K_CTX = 100)</td><td><code>cfg.block_size = 8</code></td></tr>
+<tr><td>2</td><td>Predictor positional symmetry — γ(ctx_coords) added to predictor context tokens</td><td><code>cfg.predictor_pos_symmetric = True</code></td></tr>
+<tr><td>3</td><td>Attention-pool probe head — learnable Q cross-attends to <code>g</code> instead of <code>g.mean(dim=1)</code></td><td><code>cfg.probe_use_attn_pool = True</code></td></tr>
+<tr><td>4</td><td>Target blocks disjoint from each other (not just from context)</td><td><code>cfg.disjoint_targets = True</code></td></tr>
+<tr><td>5</td><td>Probe / test serves the full 40 % pool, not the legacy K_HALF = 205</td><td><code>cfg.test_full_pool = True</code></td></tr>
+</table>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="degrade">8. Anti-degradation mitigations</h2>
+
+<p>
+JEPA's downstream probe accuracy often peaks ~200 epochs in and then drifts down
+("predictor saturation + spectral collapse + smooth-L1's magnitude pull"). v2 adds
+four mitigations:
+</p>
+<table>
+<tr><th>#</th><th>Mitigation</th><th>Toggle</th></tr>
+<tr><td>M1</td><td>Save best-<strong>probe-acc</strong> checkpoint, not just best-loss</td><td>always on; <code>pbb_probe_best.pt</code></td></tr>
+<tr><td>M2</td><td>Early-stop when probe acc hasn't improved for N consecutive checks</td><td><code>cfg.probe_patience = 3</code></td></tr>
+<tr><td>M3</td><td>Cap EMA momentum below 1.000 so target encoder never freezes</td><td><code>cfg.ema_end = 0.9999</code></td></tr>
+<tr><td>M5</td><td>Cosine similarity loss instead of smooth-L1 (no magnitude pull)</td><td><code>cfg.loss_type = "cosine"</code></td></tr>
+<tr><td>M6</td><td>Drop DINO-style centering (not part of canonical i-JEPA)</td><td><code>cfg.use_centering = False</code></td></tr>
+</table>
+
+<div class="warn">
+  <strong>Why loss can rise while probe accuracy rises:</strong> the smooth-L1 / cosine loss
+  against a moving EMA target is a <em>proxy</em>. Once the encoder produces more discriminative
+  features, the target distribution shifts faster than the predictor can chase, inflating
+  the proxy loss even as features genuinely improve. This is a well-known JEPA pitfall — never
+  use loss-min for the final checkpoint. <strong>Trust the probe.</strong>
+</div>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="eval">9. Evaluation: linear probing</h2>
+
+<p>The probe protocol is the standard SSL convention with two extensions for our setup:</p>
+<ol>
+  <li>Encoder is frozen (<code>requires_grad_(False)</code> saved + restored).</li>
+  <li>Head is either a single <code>Linear(D_model, 10)</code> (legacy) or an
+    <code>AttnPoolHead</code> + <code>Linear</code> pair (v2 default). The AttnPool head adds
+    a single learnable query that cross-attends to the encoder's per-token features,
+    producing one D-dim vector per image.</li>
+  <li>Probe is trained on the CIFAR-10 train set (50 K images) using the test-mode
+    sampler — same fixed deterministic 40 % view that the test loader uses. So probe-train
+    and probe-eval see the same input distribution.</li>
+</ol>
+
+<pre><code># pbb/probe.py
+def quick_probe(context_encoder, train_eval_loader, test_loader,
+                d_model, num_epochs=3, use_attn_pool=False, ...):
+    # ... freezes encoder, trains head, evaluates, restores encoder state ...
+    return test_accuracy</code></pre>
+
+<h3>Two-axis sweep at the end of the training notebook</h3>
+<p>
+A bottom-of-notebook cell lets you re-probe the trained model with:
+</p>
+<ul>
+  <li><code>USE_TARGET_ENCODER ∈ {False, True}</code> — context_encoder vs target_encoder for feature extraction.
+    The target encoder is the train/test distribution match for K_TEST = K_POOL because it always
+    saw 410-pixel inputs during JEPA training.</li>
+  <li><code>K_TEST_OVERRIDE ∈ {100, 150, 205, 300, 410}</code> — test context size, set via <code>cfg.k_test</code>.</li>
+</ul>
+
+<!-- ────────────────────────────────────────────────────────── -->
+<h2 id="summary">10. Recipe at a glance</h2>
+
+<table>
+<tr><th>Component</th><th>Value</th></tr>
+<tr><td>Image / pool</td><td>32 × 32 = 1024 px, fixed 410-px pool per image (40 %)</td></tr>
+<tr><td>Train context</td><td>100 px contiguous block within pool</td></tr>
+<tr><td>Train targets</td><td>4 disjoint contiguous blocks × 50 px = 200 target positions</td></tr>
+<tr><td>Test/probe context</td><td>410 px (full pool); legacy 205-px option preserved</td></tr>
+<tr><td>Tokenizer</td><td><code>W_signal·rgb + W_pos·γ(y,x)</code>; γ = 96-d Gaussian Fourier</td></tr>
+<tr><td>Encoder</td><td>6 × (curve-permute → BigBird sparse self-attn → un-permute → FFN)</td></tr>
+<tr><td>BigBird</td><td>block_size = 8, window = 1, n_global = 2, n_random = 2 → 7 blocks/query</td></tr>
+<tr><td>Serialization</td><td>{z-order, z-rev, Hilbert, Hilbert-rev}, one sampled per encoder layer</td></tr>
+<tr><td>Predictor</td><td>4-layer dense Transformer, positional symmetry on context tokens</td></tr>
+<tr><td>Target</td><td>EMA encoder (m: 0.999 → 0.9999); LayerNorm; <strong>no centering</strong></td></tr>
+<tr><td>Loss</td><td>Cosine: <code>(1 − cos(h_pred, h_tgt)).mean()</code></td></tr>
+<tr><td>Optim</td><td>AdamW (lr 2e-4, wd 1e-4), cosine LR schedule, gradient clip 1.0</td></tr>
+<tr><td>Probe</td><td>AttnPool head + Linear, trained 3 epochs, evaluated on CIFAR-10 test</td></tr>
+<tr><td>Early stop</td><td>Patience 3 probe checks (every 20 epochs); keeps probe-best checkpoint</td></tr>
+</table>
+
+<div class="ok">
+  <strong>Expected band:</strong> on this sparse-input setup, a "good" probe result is
+  <strong>50–65 %</strong>, "nice / publication-worthy" is <strong>65–75 %</strong>,
+  approaching the supervised ceiling of ~85 % at 40 % pixel density. The v2 setup
+  typically lands in the upper end of the "good" range and climbs into "nice" with
+  longer training (200+ epochs), <em>provided</em> you keep the probe-best checkpoint
+  rather than the loss-best one.
+</div>
+
+<hr>
+
+<h2 id="files">Files referenced</h2>
+<table>
+<tr><th>File</th><th>What it holds</th></tr>
+<tr><td><code>pbb/config.py</code></td><td><code>PBBConfig</code> — every hyperparameter</td></tr>
+<tr><td><code>pbb/serialization.py</code></td><td>Morton + Hilbert codes + <code>subset_perm</code> + inverse</td></tr>
+<tr><td><code>pbb/attention.py</code></td><td><code>MultiHeadAttention</code> + <code>BigBirdSparseAttention</code> (with <code>equivalent_to_dense</code> mode for testing)</td></tr>
+<tr><td><code>pbb/model.py</code></td><td><code>Tokenizer</code>, <code>EncoderBlock</code>, <code>PBBEncoder</code>, <code>PBBPredictor</code></td></tr>
+<tr><td><code>pbb/data.py</code></td><td><code>PBBChunkCIFAR10</code> with v8 multi-block masking + per-sample orderings</td></tr>
+<tr><td><code>pbb/jepa.py</code></td><td>EMA update, centering (now off), loss (smooth_l1 or cosine), diagnostics</td></tr>
+<tr><td><code>pbb/probe.py</code></td><td><code>LinearProbe</code>, <code>AttnPoolHead</code>, <code>quick_probe</code></td></tr>
+<tr><td><code>notebooks/PBB_JEPA_train_v2_input_pos_only.ipynb</code></td><td>The training notebook this document describes</td></tr>
+<tr><td><code>notebooks/PBB_JEPA_walkthrough.ipynb</code></td><td>Visualization-only walkthrough of each architectural piece</td></tr>
+</table>
+
+<footer>
+  PointBigBird-JEPA · sparse-input 40 % approach · last revised 2026-05.<br>
+  Source: <a href="https://github.com/colpark/RobustX_v0/tree/main/PointBigBird">github.com/colpark/RobustX_v0/PointBigBird</a>
+</footer>
+
+</div>
+</body>
+</html>
