@@ -5,16 +5,21 @@ from .serialization import (
     morton_code_2d, hilbert_code_2d, morton_code_3d, hilbert_code_3d,
     precompute_grid_orderings, subset_perm, invert_perm, quantize_coords,
 )
-from .attention import MultiHeadAttention, BigBirdSparseAttention, make_attention
+from .attention import (
+    MultiHeadAttention, BigBirdSparseAttention,
+    GroupedSparseAttention, CrossAttention, make_attention,
+)
 from .model import (
     GaussianFourierFeatures, Tokenizer, FeedForward,
     EncoderBlock, OmniBirdEncoder,
     PredictorBlock, OmniBirdPredictor,
+    HierarchicalEncoderBlock, PerceiverPredictor,
 )
 from .data import OmniBirdEventDataset, build_loaders, orderings_from_batch
 from .jepa import (
     ema_update, make_momentum_schedule, TargetCenter,
-    gather_target_features, jepa_loss, diag_dict, fmt_diag,
+    gather_target_features, gather_group_target_features,
+    jepa_loss, diag_dict, fmt_diag,
 )
 from .probe import LinearProbe, AttnPoolHead, extract_z, quick_probe
 from .icmr import ICMR, ModalityCrossAttn
@@ -26,15 +31,18 @@ __all__ = [
     "morton_code_2d", "hilbert_code_2d", "morton_code_3d", "hilbert_code_3d",
     "precompute_grid_orderings", "subset_perm", "invert_perm", "quantize_coords",
     # attention
-    "MultiHeadAttention", "BigBirdSparseAttention", "make_attention",
+    "MultiHeadAttention", "BigBirdSparseAttention",
+    "GroupedSparseAttention", "CrossAttention", "make_attention",
     # model
     "GaussianFourierFeatures", "Tokenizer", "FeedForward",
     "EncoderBlock", "OmniBirdEncoder", "PredictorBlock", "OmniBirdPredictor",
+    "HierarchicalEncoderBlock", "PerceiverPredictor",
     # data
     "OmniBirdEventDataset", "build_loaders", "orderings_from_batch",
     # jepa
     "ema_update", "make_momentum_schedule", "TargetCenter",
-    "gather_target_features", "jepa_loss", "diag_dict", "fmt_diag",
+    "gather_target_features", "gather_group_target_features",
+    "jepa_loss", "diag_dict", "fmt_diag",
     # probe
     "LinearProbe", "AttnPoolHead", "extract_z", "quick_probe",
     # multimodal (Phase 2)

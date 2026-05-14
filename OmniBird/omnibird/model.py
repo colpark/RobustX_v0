@@ -20,7 +20,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import MultiHeadAttention, BigBirdSparseAttention, GroupedSparseAttention
+from .attention import (
+    MultiHeadAttention, BigBirdSparseAttention,
+    GroupedSparseAttention, CrossAttention,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -186,23 +189,41 @@ class OmniBirdEncoder(nn.Module):
                  fourier_dim=96, fourier_scale=15.0,
                  serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
                  reinject_pos=False,
-                 attention_type: str = "bigbird", group_size: int = 16):
+                 attention_type: str = "bigbird", group_size: int = 16,
+                 pool: str = "mean", use_centroid_pos: bool = True):
         super().__init__()
         self.tokenizer = Tokenizer(d_model, signal_dim=signal_dim, coord_dim=coord_dim,
                                     fourier_dim=fourier_dim, fourier_scale=fourier_scale)
         self.attention_type = attention_type
         self.group_size = group_size
         # Padding multiple depends on which attention we use.
-        self.pad_multiple = group_size if attention_type == "grouped" else block_size
-        self.blocks = nn.ModuleList([
-            EncoderBlock(d_model, n_heads=n_heads, dim_head=dim_head,
-                         block_size=block_size, window=window,
-                         n_random=n_random, n_global=n_global,
-                         ffn_mult=ffn_mult,
-                         attention_type=attention_type,
-                         group_size=group_size)
-            for _ in range(n_layers)
-        ])
+        if attention_type in ("grouped", "grouped_hierarchical"):
+            self.pad_multiple = group_size
+        else:
+            self.pad_multiple = block_size
+        # Construct blocks. Hierarchical needs a callable that maps coords → emb,
+        # shared with the tokenizer's pos_proj for parameter efficiency.
+        if attention_type == "grouped_hierarchical":
+            centroid_proj = lambda c: self.tokenizer.pos_proj(self.tokenizer.gff(c))
+            self.blocks = nn.ModuleList([
+                HierarchicalEncoderBlock(
+                    d_model, n_heads=n_heads, dim_head=dim_head,
+                    group_size=group_size, ffn_mult=ffn_mult,
+                    pool=pool, use_centroid_pos=use_centroid_pos,
+                    centroid_proj=centroid_proj,
+                )
+                for _ in range(n_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                EncoderBlock(d_model, n_heads=n_heads, dim_head=dim_head,
+                             block_size=block_size, window=window,
+                             n_random=n_random, n_global=n_global,
+                             ffn_mult=ffn_mult,
+                             attention_type=attention_type,
+                             group_size=group_size)
+                for _ in range(n_layers)
+            ])
         self.norm = nn.LayerNorm(d_model)
         self.serial_orders = tuple(serial_orders)
         self.block_size = block_size
@@ -281,12 +302,27 @@ class OmniBirdEncoder(nn.Module):
                 inv = torch.cat([inv, tail], dim=1)
             extended[name] = (p, inv)
 
+        # If using HierarchicalEncoderBlock, pad coords to Kp too.
+        coords_padded = None
+        if any(isinstance(blk, HierarchicalEncoderBlock) for blk in self.blocks):
+            if coords.shape[1] != Kp:
+                pad_n = Kp - coords.shape[1]
+                pad_c = torch.zeros(B, pad_n, coords.shape[-1],
+                                     device=coords.device, dtype=coords.dtype)
+                coords_padded = torch.cat([coords, pad_c], dim=1)
+            else:
+                coords_padded = coords
+
         # Stack of encoder blocks, each picks an order at random
         order_names = list(self.serial_orders)
         for blk in self.blocks:
             name = order_names[torch.randint(0, len(order_names), (1,)).item()]
             perm, inv = extended[name]
-            x = blk(x, perm, inv, pos_emb=pos_emb, key_padding_mask=pm)
+            if isinstance(blk, HierarchicalEncoderBlock):
+                x = blk(x, perm, inv, pos_emb=pos_emb, coords=coords_padded,
+                        key_padding_mask=pm)
+            else:
+                x = blk(x, perm, inv, pos_emb=pos_emb, key_padding_mask=pm)
 
         x = self.norm(x)
         return x[:, :K_orig]    # strip padding
@@ -356,3 +392,157 @@ class OmniBirdPredictor(nn.Module):
             x = blk(x)
         x = self.norm(x[:, K:])
         return self.proj_out(x)
+
+
+# ---------------------------------------------------------------------------
+# HierarchicalEncoderBlock — within-group + between-group attention per layer
+# ---------------------------------------------------------------------------
+
+class HierarchicalEncoderBlock(nn.Module):
+    """Two-level attention block (Swin V2 / PointConT style):
+
+        x = x + within_group_attn(LN(x))                # local, dense within G windows
+        g = pool(x, group=G)                            # one summary token per window
+        x = x + broadcast(between_group_attn(LN(g)))    # global, dense across N/G group tokens
+        x = x + ffn(LN(x))
+
+    Plus optional centroid positional residual added BEFORE both attentions:
+        x = x + pos_proj(γ(group_centroid))
+
+    Used by OmniBirdEncoder when attention_type='grouped_hierarchical'.
+    """
+
+    def __init__(self, dim, n_heads=8, dim_head=32, group_size=16, ffn_mult=4,
+                 pool: str = "mean", use_centroid_pos: bool = True,
+                 centroid_proj=None):
+        super().__init__()
+        self.G = group_size
+        self.pool = pool
+        self.use_centroid_pos = use_centroid_pos
+        # The centroid projection is shared with the encoder's tokenizer (passed in by reference)
+        # so we don't add new params; just reuse the per-token γ + pos_proj.
+        self.centroid_proj = centroid_proj    # callable: coords -> embeddings
+
+        self.norm_w = nn.LayerNorm(dim)
+        self.within = GroupedSparseAttention(dim, n_heads=n_heads, dim_head=dim_head,
+                                              group_size=group_size)
+        self.norm_b = nn.LayerNorm(dim)
+        self.between = MultiHeadAttention(dim, n_heads=n_heads, dim_head=dim_head)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, mult=ffn_mult)
+        self.required_multiple = group_size
+
+    def forward(self, x, perm, inverse_perm, pos_emb=None, coords=None,
+                key_padding_mask=None):
+        # Per-token positional residual (existing behavior in OmniBirdEncoder)
+        if pos_emb is not None:
+            x = x + pos_emb
+
+        x_p = _gather_along_seq(x, perm)
+        pm_p = _gather_mask(key_padding_mask, perm) if key_padding_mask is not None else None
+
+        # ── Optional: per-group centroid positional residual ───────────────
+        if self.use_centroid_pos and coords is not None and self.centroid_proj is not None:
+            coords_p = _gather_along_seq(coords, perm)               # (B, N, D_c)
+            B, N, D_c = coords_p.shape
+            G = self.G
+            NG = N // G
+            cent = coords_p.view(B, NG, G, D_c).mean(dim=2)           # (B, NG, D_c)
+            cent_bcast = cent.unsqueeze(2).expand(B, NG, G, D_c).reshape(B, N, D_c)
+            x_p = x_p + self.centroid_proj(cent_bcast)
+
+        # ── Step 1: within-group attention ──────────────────────────────
+        x_p = x_p + self.within(self.norm_w(x_p), key_padding_mask=pm_p)
+
+        # ── Step 2: between-group attention ─────────────────────────────
+        B, N, D = x_p.shape
+        G = self.G
+        NG = N // G
+        if self.pool == "mean":
+            g_tok = x_p.view(B, NG, G, D).mean(dim=2)
+        elif self.pool == "max":
+            g_tok = x_p.view(B, NG, G, D).max(dim=2).values
+        else:
+            g_tok = x_p.view(B, NG, G, D).mean(dim=2)
+        # Group key-padding mask: group is "padded" only if ALL its events are padded
+        g_kpm = pm_p.view(B, NG, G).all(dim=2) if pm_p is not None else None
+        delta_between = self.between(self.norm_b(g_tok), key_padding_mask=g_kpm)
+        broadcast = delta_between.unsqueeze(2).expand(B, NG, G, D).reshape(B, N, D)
+        x_p = x_p + broadcast
+
+        # ── FFN ────────────────────────────────────────────────────────
+        x_p = x_p + self.ffn(self.norm_ffn(x_p))
+
+        return _gather_along_seq(x_p, inverse_perm)
+
+
+# ---------------------------------------------------------------------------
+# PerceiverPredictor — few group-level queries cross-attend to context
+# ---------------------------------------------------------------------------
+
+class PerceiverPredictor(nn.Module):
+    """Cross-attention predictor with N_q group-level queries.
+
+    For OmniBird-JEPA's per-group prediction:
+      - Queries are 4 target-block centroids (or N_q in general).
+      - Keys/values are the long context-encoder feature sequence.
+    Compute scales as O(N_q · K_ctx · D) per layer — cheap when N_q ≪ K_ctx.
+
+    Each layer:  cross-attn(q ← ctx) → self-attn(q) → ffn
+    """
+
+    def __init__(self, d_model=256, d_pred=192, n_layers=4, n_heads=6, dim_head=32,
+                 coord_dim=3, fourier_dim=96, fourier_scale=15.0, ffn_mult=4,
+                 pos_symmetric: bool = True):
+        super().__init__()
+        self.proj_in    = nn.Linear(d_model, d_pred)
+        self.gff        = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
+        self.proj_pos   = nn.Linear(2 * fourier_dim, d_pred)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, d_pred))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.pos_symmetric = pos_symmetric
+
+        # Stack of (cross-attn, self-attn, ffn) layers
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(nn.ModuleDict({
+                "norm_q":   nn.LayerNorm(d_pred),
+                "norm_kv":  nn.LayerNorm(d_pred),
+                "cross":    CrossAttention(d_pred, n_heads=n_heads, dim_head=dim_head),
+                "norm_s":   nn.LayerNorm(d_pred),
+                "self_attn": MultiHeadAttention(d_pred, n_heads=n_heads, dim_head=dim_head),
+                "norm_f":   nn.LayerNorm(d_pred),
+                "ffn":      FeedForward(d_pred, mult=ffn_mult),
+            }))
+        self.norm     = nn.LayerNorm(d_pred)
+        self.proj_out = nn.Linear(d_pred, d_model)
+
+    def forward(self, ctx_feat, query_coords, ctx_coords=None, ctx_key_padding_mask=None):
+        """
+        ctx_feat:     (B, K_ctx, D_model)
+        query_coords: (B, N_q,   coord_dim)
+        ctx_coords:   (B, K_ctx, coord_dim)  — required if pos_symmetric=True
+        Returns: h_pred (B, N_q, D_model)
+        """
+        B = ctx_feat.size(0)
+        ctx_tok = self.proj_in(ctx_feat)
+        if self.pos_symmetric:
+            assert ctx_coords is not None, "pos_symmetric=True needs ctx_coords"
+            ctx_tok = ctx_tok + self.proj_pos(self.gff(ctx_coords))
+
+        # Initialize each query with its γ(coord) + mask_token
+        q = self.proj_pos(self.gff(query_coords)) + self.mask_token
+
+        for blk in self.layers:
+            # Cross-attn: q ← ctx_tok
+            q = q + blk["cross"](
+                blk["norm_q"](q),
+                blk["norm_kv"](ctx_tok),
+                key_padding_mask=ctx_key_padding_mask,
+            )
+            # Self-attn among queries (cheap, e.g. 4×4)
+            q = q + blk["self_attn"](blk["norm_s"](q))
+            # FFN
+            q = q + blk["ffn"](blk["norm_f"](q))
+
+        return self.proj_out(self.norm(q))

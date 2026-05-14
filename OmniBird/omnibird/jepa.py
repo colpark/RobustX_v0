@@ -69,6 +69,32 @@ def gather_target_features(g_tgt: torch.Tensor, tgt_pool_pos: torch.Tensor) -> t
     return torch.gather(g_tgt, 1, idx)
 
 
+def gather_group_target_features(g_tgt: torch.Tensor, tgt_pool_pos: torch.Tensor,
+                                  n_pred_blocks: int, n_tgt_per_block: int,
+                                  pool: str = "mean") -> torch.Tensor:
+    """Per-target-block summary features (Point-MAE / Point-JEPA style).
+
+    Args:
+        g_tgt:           (B, K_pool, D)  target-encoder features over the pool
+        tgt_pool_pos:    (B, n_pred_blocks * n_tgt_per_block) long
+        n_pred_blocks:   number of target blocks (default 4)
+        n_tgt_per_block: events per block
+        pool:            'mean' | 'max' — aggregation within each block
+    Returns:
+        h_tgt_group:     (B, n_pred_blocks, D) — one summary feature per block.
+    """
+    B, _, D = g_tgt.shape
+    idx = tgt_pool_pos.unsqueeze(-1).expand(B, tgt_pool_pos.shape[1], D)
+    per_event = torch.gather(g_tgt, 1, idx)                       # (B, N_tgt, D)
+    per_event = per_event.view(B, n_pred_blocks, n_tgt_per_block, D)
+    if pool == "mean":
+        return per_event.mean(dim=2)
+    elif pool == "max":
+        return per_event.max(dim=2).values
+    else:
+        raise ValueError(f"unknown pool: {pool!r}")
+
+
 # ---------------------------------------------------------------------------
 # JEPA loss
 # ---------------------------------------------------------------------------

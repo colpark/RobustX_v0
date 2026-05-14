@@ -268,6 +268,47 @@ class GroupedSparseAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# CrossAttention — explicit Q from one source, K/V from another
+# ---------------------------------------------------------------------------
+
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention. Q ∈ ℝᴮˣᴺᑫˣᴰ, K=V ∈ ℝᴮˣᴺᴋˣᴰ.
+
+    Used by PerceiverPredictor where Q are the few group-level target queries
+    and K/V are the long context-encoder features.
+    """
+
+    def __init__(self, dim, n_heads: int = 8, dim_head: int = 32, bias_qkv: bool = False):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.to_q  = nn.Linear(dim, inner, bias=bias_qkv)
+        self.to_kv = nn.Linear(dim, inner * 2, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+
+    def forward(self, q_in, kv_in, key_padding_mask=None):
+        """q_in: (B, Nq, D), kv_in: (B, Nk, D), kpm: (B, Nk) bool, True=pad."""
+        B, Nq, _ = q_in.shape
+        Nk = kv_in.size(1)
+        H, Dh = self.n_heads, self.dim_head
+
+        q = self.to_q(q_in).view(B, Nq, H, Dh).transpose(1, 2)     # (B, H, Nq, Dh)
+        kv = self.to_kv(kv_in)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(B, Nk, H, Dh).transpose(1, 2)
+        v = v.view(B, Nk, H, Dh).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale            # (B, H, Nq, Nk)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask.view(B, 1, 1, Nk), float("-inf"))
+        attn = scores.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, Nq, -1)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
 # Convenience: tied factory
 # ---------------------------------------------------------------------------
 
