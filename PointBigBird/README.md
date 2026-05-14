@@ -42,7 +42,8 @@ PointBigBird/
 │   ├── test_serialization.py    # 4 orderings bijective; subset round-trip
 │   └── test_attention.py        # BigBird == dense in full mode; padding; speed
 └── notebooks/
-    └── PBB_JEPA_walkthrough.ipynb   # visual walkthrough with diagrams
+    ├── PBB_JEPA_walkthrough.ipynb   # visual walkthrough (no training)
+    └── PBB_JEPA_train.ipynb         # training notebook (mirrors train.py + plots)
 ```
 
 ## Quick start
@@ -85,13 +86,26 @@ python train.py --epochs 100
 - Sparse mode is non-deterministic across forwards (random block resampling)
 - Speed benchmark: sparse vs dense on (B=4, N=1024, D=128)
 
-## Notebook
+## Notebooks
 
-`notebooks/PBB_JEPA_walkthrough.ipynb` visualizes:
+**`notebooks/PBB_JEPA_walkthrough.ipynb`** — visual walkthrough (20 cells):
+1. Tokenization (RGB + γ features)
+2. The 4 curve orderings on a 32×32 grid
+3. Per-sample subset orderings on a 100-pixel context
+4. BigBird attention pattern heatmaps (N=128 toy, N=1024 toy)
+5. Equivalence sanity: BigBird(`equivalent_to_dense=True`) == MHA
+6. Per-layer random shuffling (log which ordering each layer picked)
+7. Full forward pass on one CIFAR-10 image
+8. v8-style 5-panel data viz (context + 4 disjoint target blocks)
+9. ASCII architecture diagram
 
-1. The 4 curve orderings on a 32×32 grid (every nth pixel colored)
-2. How a context chunk gets re-ordered by each curve
-3. The BigBird attention pattern (which positions attend to which)
-4. Per-layer order shuffling
-5. Full forward pass with shapes
-6. The JEPA loss on a single image
+**`notebooks/PBB_JEPA_train.ipynb`** — training notebook (19 cells):
+1. Setup + config overrides
+2. Data loaders (train / train_eval / test)
+3. Build models (encoder, EMA target, predictor, target center)
+4. Optimizer + cosine LR + EMA momentum schedule
+5. Resume from `pbb_last.pt` if present
+6. Embedded linear probe (uses `train_eval_loader` for K_HALF input)
+7. Training loop with per-step diagnostics and per-epoch probe
+8. Plot training curves (loss, cosine, probe accuracy)
+9. Collapse diagnostics (‖g‖, σ_batch(h_pred), σ_token(g), ‖center‖, …)
