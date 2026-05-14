@@ -73,10 +73,21 @@ def gather_target_features(g_tgt: torch.Tensor, tgt_pool_pos: torch.Tensor) -> t
 # JEPA loss
 # ---------------------------------------------------------------------------
 
-def jepa_loss(h_pred: torch.Tensor, h_tgt: torch.Tensor) -> torch.Tensor:
-    """smooth-L1 between predictor output and (centered + LayerNormed) targets.
-    Both inputs shape (B, N_tgt, D)."""
-    return F.smooth_l1_loss(h_pred, h_tgt)
+def jepa_loss(h_pred: torch.Tensor, h_tgt: torch.Tensor, loss_type: str = "smooth_l1") -> torch.Tensor:
+    """JEPA distance between predictor output and (centered + LayerNormed) targets.
+
+    Both inputs: (B, N_tgt, D).
+
+    - "smooth_l1" (legacy): penalizes pointwise magnitude differences.
+    - "cosine":             1 - cos(h_pred, h_tgt) averaged over (B, N_tgt).
+                            Direction-only — no pull on h_pred's magnitude.
+                            Tends to be more robust over long training.
+    """
+    if loss_type == "smooth_l1":
+        return F.smooth_l1_loss(h_pred, h_tgt)
+    elif loss_type == "cosine":
+        return (1.0 - F.cosine_similarity(h_pred, h_tgt, dim=-1)).mean()
+    raise ValueError(f"unknown loss_type: {loss_type!r} (expected 'smooth_l1' or 'cosine')")
 
 
 # ---------------------------------------------------------------------------

@@ -72,8 +72,15 @@ class PBBConfig:
 
     # JEPA
     ema_start: float = 0.999
-    ema_end: float = 1.000
+    # ema_end: 1.000 freezes the target encoder by end of training (legacy).
+    # 0.9999 keeps it slowly moving forever → avoids late-training "predictor
+    # saturation" failure mode where features drift after EMA freezes.
+    ema_end: float = 0.9999
     center_momentum: float = 0.9
+    # JEPA distance metric. "smooth_l1" (legacy) penalizes magnitude differences;
+    # "cosine" uses 1 - cos(h_pred, h_tgt), which is direction-only and tends to
+    # be more robust over long training (no magnitude pull on h_pred toward h_tgt).
+    loss_type: str = "smooth_l1"
 
     # Optim
     batch_size: int = 64
@@ -82,6 +89,9 @@ class PBBConfig:
     weight_decay: float = 1e-4
     probe_interval: int = 20
     probe_epochs: int = 3
+    # Early-stop training if the embedded probe accuracy does not improve for
+    # this many consecutive probe checks. 0 disables (legacy behavior).
+    probe_patience: int = 0
 
     # Logging
     log_every: int = 50
