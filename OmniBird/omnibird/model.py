@@ -24,6 +24,27 @@ from .attention import MultiHeadAttention, BigBirdSparseAttention
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def get_sinusoidal_embeddings(n: int, d: int) -> torch.Tensor:
+    """Standard sinusoidal positional embeddings, shape (n, d), with d even.
+
+    Used by ICMR to initialize the shared learnable latent set so that even at
+    init the latent slots span distinguishable positions in the d-dim space
+    (perceiver-style trick — avoids degenerate symmetries when all latents
+    start identical).
+    """
+    assert d % 2 == 0, f"d must be even, got {d}"
+    position = torch.arange(n, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, d, 2).float() * -(math.log(10000.0) / d))
+    pe = torch.zeros(n, d)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
+# ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
 
