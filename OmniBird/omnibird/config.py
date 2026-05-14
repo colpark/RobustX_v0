@@ -1,0 +1,79 @@
+"""Default hyperparameters for OmniBird — multimodal extension of PointBigBird-JEPA.
+
+The single-modality (event-only) setup mirrors the PointBigBird v2 sparse-input
+recipe, adapted for 3-D event coordinates (x, y, t). The multimodal setup adds
+an ICMR-style cross-modal refinement on top (see icmr.py).
+"""
+
+from dataclasses import dataclass, field
+from typing import Tuple
+
+
+@dataclass
+class OmniBirdConfig:
+    # ── Event-camera coords (single-modality default) ──────────────────────
+    coord_dim: int = 3            # events: (x, y, t)
+    signal_dim: int = 1           # events: polarity (+/-1, encoded as scalar)
+    side: int = 32                # grid resolution per axis for serialization (32^3 = 32768 cells)
+
+    # ── Per-sample budget ──────────────────────────────────────────────────
+    n_events_total: int = 2048    # total events per sample (after sub-sampling)
+    n_ctx: int = 1024             # context: ~50% of available events
+    n_tgt_per_block: int = 64
+    n_pred_blocks: int = 4
+    n_tgt: int = 256              # = n_pred_blocks * n_tgt_per_block
+
+    # ── Tokenizer ──────────────────────────────────────────────────────────
+    fourier_dim: int = 96         # γ output = 2 * fourier_dim per coord_dim
+    fourier_scale: float = 15.0
+
+    # ── Encoder ────────────────────────────────────────────────────────────
+    d_model: int = 256
+    n_heads: int = 8
+    dim_head: int = 32
+    n_layers_enc: int = 6
+    ffn_mult: int = 4
+
+    # ── Predictor ──────────────────────────────────────────────────────────
+    d_pred: int = 192
+    n_heads_pred: int = 6
+    dim_head_pred: int = 32
+    n_layers_pred: int = 4
+    predictor_pos_symmetric: bool = True
+
+    # ── BigBird sparse attention ───────────────────────────────────────────
+    block_size: int = 8
+    window: int = 1
+    n_random: int = 2
+    n_global: int = 2
+
+    # ── Serialization ──────────────────────────────────────────────────────
+    serial_orders: Tuple[str, ...] = ('z', 'z_rev', 'hilbert', 'hilbert_rev')
+    reinject_pos: bool = False    # input-pos-only by default
+    disjoint_targets: bool = True
+
+    # ── JEPA ───────────────────────────────────────────────────────────────
+    loss_type: str = "cosine"     # canonical v2 default
+    use_centering: bool = False   # canonical i-JEPA: no DINO centering
+    ema_start: float = 0.999
+    ema_end: float = 0.9999
+
+    # ── Probe ──────────────────────────────────────────────────────────────
+    probe_use_attn_pool: bool = True
+    probe_interval: int = 20
+    probe_epochs: int = 3
+    probe_patience: int = 5
+
+    # ── Optim ──────────────────────────────────────────────────────────────
+    batch_size: int = 32
+    epochs: int = 100
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    log_every: int = 50
+    ckpt_dir: str = "./checkpoints_omnibird"
+
+    # ── Multimodal (Phase 2 — see icmr.py) ─────────────────────────────────
+    multimodal: bool = False                       # turn on cross-modal ICMR
+    modalities: Tuple[str, ...] = ('events',)      # ('events', 'rgb') when multimodal
+    icmr_iters: int = 2                            # ICMR refinement iterations
+    icmr_n_latents: int = 256                      # shared latent set size
