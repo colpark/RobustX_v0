@@ -95,12 +95,23 @@ class EncoderBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, mult=ffn_mult)
 
-    def forward(self, x, perm, inverse_perm, key_padding_mask=None):
+    def forward(self, x, perm, inverse_perm, pos_emb=None, key_padding_mask=None):
         """x: (B, N, D)  N divisible by block_size
         perm:         (B, N) — permutes original→sorted-by-curve
         inverse_perm: (B, N) — inverse of perm
+        pos_emb:      (B, N, D) — positional embedding to re-inject as a residual
+                                  before attention. If None, no re-injection.
         key_padding_mask: (B, N) bool in *original* order
+
+        Re-injecting pos_emb at every layer is what makes the per-layer random
+        re-shuffling meaningful: it forces the model to rely on the true spatial
+        positional embedding rather than current sequence-position, since sequence
+        position changes layer to layer but pos_emb is the same true (y, x).
         """
+        # Re-inject true positional embedding as a residual at this layer
+        if pos_emb is not None:
+            x = x + pos_emb
+
         # Gather into curve order (and gather padding mask too)
         x_p = _gather_along_seq(x, perm)
         pm_p = _gather_mask(key_padding_mask, perm) if key_padding_mask is not None else None
@@ -125,7 +136,8 @@ class PBBEncoder(nn.Module):
     def __init__(self, d_model=256, n_layers=6, n_heads=8, dim_head=32,
                  block_size=32, window=1, n_random=2, n_global=2,
                  ffn_mult=4, rgb_channels=3, fourier_dim=96, fourier_scale=15.0,
-                 serial_orders=("z", "z_rev", "hilbert", "hilbert_rev")):
+                 serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
+                 reinject_pos=True):
         super().__init__()
         self.tokenizer = Tokenizer(d_model, rgb_channels, fourier_dim, fourier_scale)
         self.blocks = nn.ModuleList([
@@ -138,6 +150,16 @@ class PBBEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.serial_orders = tuple(serial_orders)
         self.block_size = block_size
+        self.reinject_pos = reinject_pos
+
+    def compute_pos_emb(self, coords):
+        """pos_emb = pos_proj(γ(coords)) — same projection used by the tokenizer.
+
+        Re-using the tokenizer's pos_proj ties the input-level and per-layer
+        positional embeddings, which keeps the parameter count flat and means
+        a single set of pos weights is learned.
+        """
+        return self.tokenizer.pos_proj(self.tokenizer.gff(coords))
 
     @staticmethod
     def _pad_to_block_multiple(x, block_size, key_padding_mask):
@@ -173,15 +195,28 @@ class PBBEncoder(nn.Module):
         """
         # Tokenize
         x = self.tokenizer(pixels, coords)                  # (B, K, D)
+
+        # Compute the *true* positional embedding once (before padding).
+        # We re-add it as a residual at every encoder layer so the model
+        # always has access to true spatial position, regardless of how
+        # earlier layers re-shuffled the sequence.
+        pos_emb = self.compute_pos_emb(coords) if self.reinject_pos else None
+
         x, pm, K_orig = self._pad_to_block_multiple(x, self.block_size, key_padding_mask)
         B, Kp, D = x.shape
+
+        # Pad pos_emb to the same length with zeros (padded positions don't matter
+        # since their attention contribution is masked out anyway).
+        if pos_emb is not None and pos_emb.shape[1] != Kp:
+            rem = Kp - pos_emb.shape[1]
+            pad_pe = torch.zeros(B, rem, D, device=x.device, dtype=x.dtype)
+            pos_emb = torch.cat([pos_emb, pad_pe], dim=1)
 
         # Extend orderings to padded length: pad indices stay at the end in identity order
         extended = {}
         for name, d in orderings.items():
             p = d["perm"]; inv = d["inverse"]
             if p.shape[1] != Kp:
-                # Pad positions stay where they are (identity at tail)
                 tail = torch.arange(p.shape[1], Kp, device=p.device).unsqueeze(0).expand(B, -1)
                 p = torch.cat([p, tail], dim=1)
                 inv = torch.cat([inv, tail], dim=1)
@@ -192,7 +227,7 @@ class PBBEncoder(nn.Module):
         for blk in self.blocks:
             name = order_names[torch.randint(0, len(order_names), (1,)).item()]
             perm, inv = extended[name]
-            x = blk(x, perm, inv, key_padding_mask=pm)
+            x = blk(x, perm, inv, pos_emb=pos_emb, key_padding_mask=pm)
 
         x = self.norm(x)
         return x[:, :K_orig]    # strip padding

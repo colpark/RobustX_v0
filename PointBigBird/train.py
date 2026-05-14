@@ -63,6 +63,7 @@ def main():
         ffn_mult=cfg.ffn_mult, fourier_dim=cfg.fourier_dim,
         fourier_scale=cfg.fourier_scale,
         serial_orders=cfg.serial_orders,
+        reinject_pos=cfg.reinject_pos,
     ).to(device)
     target_encoder = copy.deepcopy(context_encoder).to(device)
     for q in target_encoder.parameters(): q.requires_grad_(False)

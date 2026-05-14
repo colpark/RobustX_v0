@@ -49,6 +49,12 @@ class PBBConfig:
     # Serialization — 4 orderings, one sampled per encoder layer
     serial_orders: Tuple[str, ...] = ('z', 'z_rev', 'hilbert', 'hilbert_rev')
 
+    # Re-inject positional embedding as a residual at every encoder layer.
+    # Required for per-layer reshuffling to actually motivate the model to
+    # use *true* spatial position (otherwise it can latch onto current-layer
+    # sequence position, which changes with the curve).
+    reinject_pos: bool = True
+
     # JEPA
     ema_start: float = 0.999
     ema_end: float = 1.000
