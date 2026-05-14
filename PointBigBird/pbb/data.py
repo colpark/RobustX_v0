@@ -141,8 +141,15 @@ class PBBChunkCIFAR10(Dataset):
             sample.update(self._pack_orderings("pool", pool_ords))
             return sample
         else:
-            # Test-time context: full pool (40%) if cfg.test_full_pool, else first K_HALF (20%).
-            if getattr(cfg, "test_full_pool", False):
+            # Test-time context size, in priority order:
+            #   1. cfg.k_test > 0          → exactly that many pool pixels
+            #   2. cfg.test_full_pool=True → full K_POOL pool
+            #   3. otherwise               → first K_HALF (legacy 20% contract)
+            k_test_cfg = getattr(cfg, "k_test", 0) or 0
+            if k_test_cfg > 0:
+                k_test = min(k_test_cfg, cfg.k_pool)
+                ctx_idx = pool[:k_test]
+            elif getattr(cfg, "test_full_pool", False):
                 ctx_idx = pool                              # all K_POOL = 410 pool pixels
             else:
                 ctx_idx = pool[:cfg.k_half]                 # first K_HALF = 205 (legacy)

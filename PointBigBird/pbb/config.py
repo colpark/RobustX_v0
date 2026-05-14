@@ -63,11 +63,12 @@ class PBBConfig:
     predictor_pos_symmetric: bool = False
     probe_use_attn_pool: bool = False
 
-    # Test-time input size:
-    #   test_full_pool=False (default): test loader serves K_HALF=205 pool pixels (legacy 20% contract)
-    #   test_full_pool=True           : test loader serves all K_POOL=410 pool pixels (full 40% budget)
-    # When True, the probe / test inputs match the target encoder's training distribution exactly
-    # (the target encoder always saw the full pool during JEPA training).
+    # Test-time input size — picked in this order of precedence:
+    #   1. cfg.k_test > 0          → use exactly cfg.k_test pool pixels (any integer 1..k_pool)
+    #   2. cfg.test_full_pool=True → use all K_POOL=410 pool pixels (full 40% budget)
+    #   3. otherwise               → use K_HALF=205 pool pixels (legacy 20% contract)
+    # Useful for sweeping over test-time context size to plot probe acc vs. K_TEST.
+    k_test: int = 0                       # 0 = "auto from test_full_pool"; > 0 overrides
     test_full_pool: bool = False
 
     # JEPA
