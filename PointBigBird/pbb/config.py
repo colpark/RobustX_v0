@@ -82,6 +82,12 @@ class PBBConfig:
     # be more robust over long training (no magnitude pull on h_pred toward h_tgt).
     loss_type: str = "smooth_l1"
 
+    # DINO-style centering of target features. NOT part of canonical i-JEPA —
+    # we used to inherit it from the v1–v8 OmniField-JEPA setup. False matches
+    # the i-JEPA spec (loss = smooth_L1(h_pred, LayerNorm(h_tgt))) and avoids
+    # the late-training "center drift" failure mode.
+    use_centering: bool = False
+
     # Optim
     batch_size: int = 64
     epochs: int = 100
