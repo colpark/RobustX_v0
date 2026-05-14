@@ -54,6 +54,10 @@ class MultiHeadAttention(nn.Module):
                 key_padding_mask.view(B, 1, 1, N), float("-inf")
             )
         attn = F.softmax(scores, dim=-1)
+        # Rows where every key is masked yield NaN (0/0). Zero them out — the
+        # query producing such a row is itself padded, so its output is unused.
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
         out = torch.einsum("bhnm,bhmd->bhnd", attn, v)             # (B, H, N, Dh)
         out = out.transpose(1, 2).contiguous().view(B, N, -1)       # (B, N, H*Dh)
         return self.to_out(out)
@@ -154,6 +158,8 @@ class BigBirdSparseAttention(nn.Module):
                 key_padding_mask.view(q.size(0), 1, 1, -1), float("-inf")
             )
         attn = F.softmax(scores, dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
         return torch.einsum("bhnm,bhmd->bhnd", attn, v)
 
     def forward(self, x, key_padding_mask=None):
@@ -203,6 +209,8 @@ class BigBirdSparseAttention(nn.Module):
             )
 
         attn = F.softmax(scores, dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
         out_b = torch.einsum("bhnqk,bhnkd->bhnqd", attn, v_sel)         # (B, H, NB, BS, Dh)
         out = out_b.reshape(B, H, N, Dh).transpose(1, 2).contiguous().view(B, N, -1)
         return self.to_out(out)
@@ -262,6 +270,10 @@ class GroupedSparseAttention(nn.Module):
             kpm = key_padding_mask.view(B, NG, G).unsqueeze(2).unsqueeze(3)
             scores = scores.masked_fill(kpm, float("-inf"))
         attn = scores.softmax(dim=-1)
+        # Fully-padded groups produce all-masked rows → softmax → NaN.
+        # Zero them out; padded queries are unused downstream anyway.
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
         out = attn @ v                                           # (B, NG, H, G, Dh)
         out = out.permute(0, 1, 3, 2, 4).contiguous().view(B, N, H * Dh)
         return self.to_out(out)
@@ -304,6 +316,8 @@ class CrossAttention(nn.Module):
         if key_padding_mask is not None:
             scores = scores.masked_fill(key_padding_mask.view(B, 1, 1, Nk), float("-inf"))
         attn = scores.softmax(dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
         out = (attn @ v).transpose(1, 2).contiguous().view(B, Nq, -1)
         return self.to_out(out)
 
