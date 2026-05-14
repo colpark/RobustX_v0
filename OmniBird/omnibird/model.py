@@ -204,13 +204,13 @@ class OmniBirdEncoder(nn.Module):
         # Construct blocks. Hierarchical needs a callable that maps coords → emb,
         # shared with the tokenizer's pos_proj for parameter efficiency.
         if attention_type == "grouped_hierarchical":
-            centroid_proj = lambda c: self.tokenizer.pos_proj(self.tokenizer.gff(c))
             self.blocks = nn.ModuleList([
                 HierarchicalEncoderBlock(
                     d_model, n_heads=n_heads, dim_head=dim_head,
                     group_size=group_size, ffn_mult=ffn_mult,
                     pool=pool, use_centroid_pos=use_centroid_pos,
-                    centroid_proj=centroid_proj,
+                    coord_dim=coord_dim, fourier_dim=fourier_dim,
+                    fourier_scale=fourier_scale,
                 )
                 for _ in range(n_layers)
             ])
@@ -414,14 +414,22 @@ class HierarchicalEncoderBlock(nn.Module):
 
     def __init__(self, dim, n_heads=8, dim_head=32, group_size=16, ffn_mult=4,
                  pool: str = "mean", use_centroid_pos: bool = True,
-                 centroid_proj=None):
+                 coord_dim: int = 3, fourier_dim: int = 96,
+                 fourier_scale: float = 15.0):
         super().__init__()
         self.G = group_size
         self.pool = pool
         self.use_centroid_pos = use_centroid_pos
-        # The centroid projection is shared with the encoder's tokenizer (passed in by reference)
-        # so we don't add new params; just reuse the per-token γ + pos_proj.
-        self.centroid_proj = centroid_proj    # callable: coords -> embeddings
+        # Own the centroid projection as proper sub-modules so DataParallel
+        # replicates them onto each device. A lambda closing over an outer
+        # module would keep a reference to the master replica on cuda:0.
+        if use_centroid_pos:
+            self.cent_gff  = GaussianFourierFeatures(coord_dim, fourier_dim,
+                                                     scale=fourier_scale)
+            self.cent_proj = nn.Linear(2 * fourier_dim, dim)
+        else:
+            self.cent_gff  = None
+            self.cent_proj = None
 
         self.norm_w = nn.LayerNorm(dim)
         self.within = GroupedSparseAttention(dim, n_heads=n_heads, dim_head=dim_head,
@@ -442,14 +450,14 @@ class HierarchicalEncoderBlock(nn.Module):
         pm_p = _gather_mask(key_padding_mask, perm) if key_padding_mask is not None else None
 
         # ── Optional: per-group centroid positional residual ───────────────
-        if self.use_centroid_pos and coords is not None and self.centroid_proj is not None:
+        if self.use_centroid_pos and coords is not None and self.cent_proj is not None:
             coords_p = _gather_along_seq(coords, perm)               # (B, N, D_c)
             B, N, D_c = coords_p.shape
             G = self.G
             NG = N // G
             cent = coords_p.view(B, NG, G, D_c).mean(dim=2)           # (B, NG, D_c)
             cent_bcast = cent.unsqueeze(2).expand(B, NG, G, D_c).reshape(B, N, D_c)
-            x_p = x_p + self.centroid_proj(cent_bcast)
+            x_p = x_p + self.cent_proj(self.cent_gff(cent_bcast))
 
         # ── Step 1: within-group attention ──────────────────────────────
         x_p = x_p + self.within(self.norm_w(x_p), key_padding_mask=pm_p)
