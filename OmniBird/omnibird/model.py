@@ -443,15 +443,7 @@ class OmniBirdEncoder(nn.Module):
                 x = blk(x, perm, inv, pos_emb=pos_emb, key_padding_mask=pm)
 
         x = self.norm(x)
-        out = x[:, :K_orig]      # strip padding
-        # Explicit position residual at the output so event_feat carries usable
-        # spatial structure for any downstream cross-attention pool. Without
-        # this, position is only ever shown to internal attention (via pre-norm
-        # reinject) and the final LN'd output is mostly content — pos queries
-        # then have nothing aligned to attend to.
-        if self.reinject_pos:
-            out = out + self.compute_pos_emb(coords)
-        return out
+        return x[:, :K_orig]    # strip padding
 
 
 # ---------------------------------------------------------------------------
