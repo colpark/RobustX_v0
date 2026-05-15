@@ -27,8 +27,16 @@ class OmniBirdConfig:
     n_pred_blocks: int = 4
     n_tgt: int = 256              # = n_pred_blocks * n_tgt_per_block
 
-    # ── Tokenizer ──────────────────────────────────────────────────────────
-    fourier_dim: int = 96         # γ output = 2 * fourier_dim per coord_dim
+    # ── Positional embedding ───────────────────────────────────────────────
+    # pos_embed:
+    #   "gaussian" — random Fourier features γ(c) = [sin(B c), cos(B c)],
+    #                B ~ N(0, scale^2). Output dim = 2 * fourier_dim.
+    #   "nerf"     — FM4NPP-style frequency encoding γ(c) =
+    #                [c, sin(2^0 c), cos(2^0 c), …, sin(2^{L-1} c), cos(2^{L-1} c)].
+    #                Output dim = (1 + 2 * nerf_freqs) * coord_dim.
+    pos_embed: str = "gaussian"
+    nerf_freqs: int = 10
+    fourier_dim: int = 96         # γ output = 2 * fourier_dim per coord_dim (gaussian only)
     fourier_scale: float = 15.0
 
     # ── Encoder ────────────────────────────────────────────────────────────

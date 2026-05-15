@@ -66,6 +66,56 @@ class GaussianFourierFeatures(nn.Module):
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
 
+class NerfEmbedder(nn.Module):
+    """NeRF-style frequency encoding (matches FM4NPP):
+
+        γ(x) = [x, sin(2^0 x), cos(2^0 x), sin(2^1 x), cos(2^1 x),
+                  ..., sin(2^{L-1} x), cos(2^{L-1} x)]
+
+    Output dim per input dim: (1 if include_input else 0) + 2 * num_freqs.
+    """
+
+    def __init__(self, coord_dim: int, num_freqs: int = 10,
+                 max_freq_log2: Optional[int] = None,
+                 include_input: bool = True, log_sampling: bool = True):
+        super().__init__()
+        self.coord_dim     = coord_dim
+        self.num_freqs     = num_freqs
+        self.include_input = include_input
+        if max_freq_log2 is None:
+            max_freq_log2 = num_freqs - 1
+        if log_sampling:
+            freqs = 2.0 ** torch.linspace(0., max_freq_log2, num_freqs)
+        else:
+            freqs = torch.linspace(2.0**0., 2.0**max_freq_log2, num_freqs)
+        self.register_buffer("freqs", freqs, persistent=False)
+        feats_per_dim = (1 if include_input else 0) + 2 * num_freqs
+        self.out_dim = feats_per_dim * coord_dim
+
+    def forward(self, x):
+        # x: (..., coord_dim) → (..., out_dim) with FM4NPP component ordering:
+        # [raw_x, sin(f0)x, cos(f0)x, sin(f1)x, cos(f1)x, ...]
+        scaled = x.unsqueeze(-2) * self.freqs.view(-1, 1)       # (..., L, D)
+        sins = torch.sin(scaled)
+        coss = torch.cos(scaled)
+        sc   = torch.stack([sins, coss], dim=-2)                # (..., L, 2, D)
+        sc   = sc.flatten(-3)                                    # (..., L*2*D)
+        if self.include_input:
+            return torch.cat([x, sc], dim=-1)
+        return sc
+
+
+def _make_pos_embedder(pos_embed: str, coord_dim: int,
+                        fourier_dim: int = 96, fourier_scale: float = 15.0,
+                        nerf_freqs: int = 10):
+    """Returns (embedder_module, output_dim)."""
+    if pos_embed == "nerf":
+        emb = NerfEmbedder(coord_dim, num_freqs=nerf_freqs)
+        return emb, emb.out_dim
+    emb = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
+    return emb, 2 * fourier_dim
+
+
 class Tokenizer(nn.Module):
     """Per-point token = signal_proj(signal) + pos_proj(γ(coord)).
 
@@ -74,11 +124,13 @@ class Tokenizer(nn.Module):
     """
 
     def __init__(self, d_model=256, signal_dim=3, coord_dim=2,
-                 fourier_dim=96, fourier_scale=15.0):
+                 fourier_dim=96, fourier_scale=15.0,
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
         super().__init__()
-        self.gff = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
+        self.gff, pos_in = _make_pos_embedder(pos_embed, coord_dim,
+                                                fourier_dim, fourier_scale, nerf_freqs)
         self.signal_proj = nn.Linear(signal_dim, d_model)
-        self.pos_proj = nn.Linear(2 * fourier_dim, d_model)
+        self.pos_proj = nn.Linear(pos_in, d_model)
 
     def forward(self, signal, coords):
         """signal: (B, K, signal_dim); coords: (B, K, coord_dim) → tokens (B, K, D)."""
@@ -193,10 +245,12 @@ class OmniBirdEncoder(nn.Module):
                  serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
                  reinject_pos=False,
                  attention_type: str = "bigbird", group_size: int = 16,
-                 pool: str = "mean", use_centroid_pos: bool = True):
+                 pool: str = "mean", use_centroid_pos: bool = True,
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
         super().__init__()
         self.tokenizer = Tokenizer(d_model, signal_dim=signal_dim, coord_dim=coord_dim,
-                                    fourier_dim=fourier_dim, fourier_scale=fourier_scale)
+                                    fourier_dim=fourier_dim, fourier_scale=fourier_scale,
+                                    pos_embed=pos_embed, nerf_freqs=nerf_freqs)
         self.attention_type = attention_type
         self.group_size = group_size
         # Padding multiple depends on which attention we use.
@@ -504,11 +558,13 @@ class PerceiverPredictor(nn.Module):
 
     def __init__(self, d_model=256, d_pred=192, n_layers=4, n_heads=6, dim_head=32,
                  coord_dim=3, fourier_dim=96, fourier_scale=15.0, ffn_mult=4,
-                 pos_symmetric: bool = True):
+                 pos_symmetric: bool = True,
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
         super().__init__()
         self.proj_in    = nn.Linear(d_model, d_pred)
-        self.gff        = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
-        self.proj_pos   = nn.Linear(2 * fourier_dim, d_pred)
+        self.gff, pos_in = _make_pos_embedder(pos_embed, coord_dim,
+                                                fourier_dim, fourier_scale, nerf_freqs)
+        self.proj_pos   = nn.Linear(pos_in, d_pred)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_pred))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.pos_symmetric = pos_symmetric
@@ -692,10 +748,12 @@ class CentroidPool(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int = 8, dim_head: int = 32,
                  coord_dim: int = 3, fourier_dim: int = 96,
-                 fourier_scale: float = 15.0, ffn_mult: int = 4):
+                 fourier_scale: float = 15.0, ffn_mult: int = 4,
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
         super().__init__()
-        self.gff_q   = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
-        self.q_proj  = nn.Linear(2 * fourier_dim, d_model)
+        self.gff_q, pos_in = _make_pos_embedder(pos_embed, coord_dim,
+                                                  fourier_dim, fourier_scale, nerf_freqs)
+        self.q_proj  = nn.Linear(pos_in, d_model)
         self.norm_q  = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
         self.cross   = CrossAttention(d_model, n_heads=n_heads, dim_head=dim_head)
@@ -733,7 +791,8 @@ class BigBirdEventEncoderWithPool(nn.Module):
                  fourier_dim: int = 96, fourier_scale: float = 15.0,
                  serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
                  reinject_pos: bool = False,
-                 side: int = 64):
+                 side: int = 64,
+                 pos_embed: str = "nerf", nerf_freqs: int = 10):
         super().__init__()
         self.coord_dim     = coord_dim
         self.side          = side
@@ -749,6 +808,7 @@ class BigBirdEventEncoderWithPool(nn.Module):
             serial_orders=serial_orders,
             reinject_pos=reinject_pos,
             attention_type="bigbird",
+            pos_embed=pos_embed, nerf_freqs=nerf_freqs,
         )
         self.pool = CentroidPool(
             d_model=d_model,
@@ -756,6 +816,7 @@ class BigBirdEventEncoderWithPool(nn.Module):
             coord_dim=coord_dim,
             fourier_dim=fourier_dim, fourier_scale=fourier_scale,
             ffn_mult=ffn_mult,
+            pos_embed=pos_embed, nerf_freqs=nerf_freqs,
         )
         for name, ranks in precompute_grid_orderings(side, ndim=coord_dim).items():
             self.register_buffer(f"_rank_{name}", ranks, persistent=False)
