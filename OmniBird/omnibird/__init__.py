@@ -7,7 +7,7 @@ from .serialization import (
 )
 from .attention import (
     MultiHeadAttention, BigBirdSparseAttention,
-    GroupedSparseAttention, CrossAttention, make_attention,
+    GroupedSparseAttention, CrossAttention, LocalCrossAttention, make_attention,
 )
 from .model import (
     GaussianFourierFeatures, NerfEmbedder, FixedPosEmbedder,
@@ -38,7 +38,7 @@ __all__ = [
     "precompute_grid_orderings", "subset_perm", "invert_perm", "quantize_coords",
     # attention
     "MultiHeadAttention", "BigBirdSparseAttention",
-    "GroupedSparseAttention", "CrossAttention", "make_attention",
+    "GroupedSparseAttention", "CrossAttention", "LocalCrossAttention", "make_attention",
     # model
     "GaussianFourierFeatures", "NerfEmbedder", "FixedPosEmbedder",
     "Tokenizer", "FeedForward",

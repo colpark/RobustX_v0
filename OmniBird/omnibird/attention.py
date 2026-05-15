@@ -323,6 +323,73 @@ class CrossAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# LocalCrossAttention — cross-attention with spatial positional bias
+# ---------------------------------------------------------------------------
+
+class LocalCrossAttention(nn.Module):
+    """Cross-attention with explicit spatial-locality bias on attention scores.
+
+        scores[q, k] = (Q · K^T)/√D − α · ‖q_coords − k_coords‖²
+
+    Locality is **structural**, not learned: regardless of Q-K alignment, the
+    softmax peaks at keys whose coordinates are near the query's. Output is
+    therefore necessarily a function of *local* event content. This removes
+    the "constant output across centroids" failure mode of standard
+    CrossAttention when used as a pool over data-conditional position queries
+    — different queries have different local neighborhoods and so cannot
+    collapse to the same output unless the events themselves are uniform.
+
+    `bias_scale` controls how local. With coords in [-1, 1]^3:
+      - bias_scale=10 (default): ~10-nat preference for near (d²≈0) vs far
+        (d²≈1) events — strong but not nearest-neighbor only.
+      - higher → more local (peaked attention).
+      - lower → more global.
+    """
+
+    def __init__(self, dim, n_heads: int = 8, dim_head: int = 32,
+                 bias_qkv: bool = False, bias_scale: float = 10.0):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.to_q  = nn.Linear(dim, inner, bias=bias_qkv)
+        self.to_kv = nn.Linear(dim, inner * 2, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+        self.bias_scale = bias_scale
+
+    def forward(self, q_in, kv_in, q_coords, k_coords, key_padding_mask=None):
+        """q_in: (B, Nq, D), kv_in: (B, Nk, D)
+        q_coords: (B, Nq, C), k_coords: (B, Nk, C) — used for locality bias.
+        kpm: (B, Nk) bool, True at padded key positions.
+        """
+        B, Nq, _ = q_in.shape
+        Nk = kv_in.size(1)
+        H, Dh = self.n_heads, self.dim_head
+
+        q = self.to_q(q_in).view(B, Nq, H, Dh).transpose(1, 2)        # (B, H, Nq, Dh)
+        kv = self.to_kv(kv_in)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(B, Nk, H, Dh).transpose(1, 2)
+        v = v.view(B, Nk, H, Dh).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale               # (B, H, Nq, Nk)
+
+        # Spatial locality bias: −α · ‖q_coord − k_coord‖²
+        diff  = q_coords.unsqueeze(2) - k_coords.unsqueeze(1)         # (B, Nq, Nk, C)
+        dist2 = (diff * diff).sum(-1)                                  # (B, Nq, Nk)
+        scores = scores - self.bias_scale * dist2.unsqueeze(1)         # broadcast over H
+
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask.view(B, 1, 1, Nk), float("-inf"))
+        attn = scores.softmax(dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, Nq, -1)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
 # Convenience: tied factory
 # ---------------------------------------------------------------------------
 

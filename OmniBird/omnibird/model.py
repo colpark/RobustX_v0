@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from .attention import (
     MultiHeadAttention, BigBirdSparseAttention,
-    GroupedSparseAttention, CrossAttention,
+    GroupedSparseAttention, CrossAttention, LocalCrossAttention,
 )
 from .serialization import (
     precompute_grid_orderings, quantize_coords, invert_perm,
@@ -828,12 +828,12 @@ class CentroidPool(nn.Module):
                  fourier_scale: float = 15.0, ffn_mult: int = 4,
                  pos_embed: str = "gaussian", nerf_freqs: int = 10,
                  shared_pos_embedder=None, shared_q_proj=None,
-                 fixed_pos_embedder: Optional[nn.Module] = None):
+                 fixed_pos_embedder: Optional[nn.Module] = None,
+                 local_bias_scale: float = 10.0):
         super().__init__()
         # Three ways to wire the centroid query positional embedding (in order
-        # of precedence): a single shared fixed embedder (preferred — matches
-        # what the encoder Tokenizer uses); the legacy "share γ+q_proj with
-        # Tokenizer" path; or a stand-alone trainable γ+q_proj.
+        # of precedence): a single shared fixed embedder; the legacy "share
+        # γ+q_proj with Tokenizer" path; or a stand-alone trainable γ+q_proj.
         if fixed_pos_embedder is not None:
             assert fixed_pos_embedder.out_dim == d_model, \
                 f"fixed_pos_embedder.out_dim={fixed_pos_embedder.out_dim} != d_model={d_model}"
@@ -851,23 +851,26 @@ class CentroidPool(nn.Module):
             self.pos_embedder = None
         self.norm_q  = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
-        self.cross   = CrossAttention(d_model, n_heads=n_heads, dim_head=dim_head)
+        # LocalCrossAttention with spatial bias: scores -= α·‖q_coord − k_coord‖²
+        # Makes constant-across-centroids output structurally impossible — the
+        # attention is forced to weight nearby events more heavily, so different
+        # centroids see different local neighborhoods.
+        self.cross   = LocalCrossAttention(d_model, n_heads=n_heads, dim_head=dim_head,
+                                            bias_scale=local_bias_scale)
         self.norm_f  = nn.LayerNorm(d_model)
         self.ffn     = FeedForward(d_model, mult=ffn_mult)
         self.norm    = nn.LayerNorm(d_model)
 
-    def forward(self, event_feat, centroids, event_kpm=None):
-        # event_feat: (B, N, D); centroids: (B, P, coord_dim); event_kpm: (B, N)
-        # Perceiver-IO style: position-derived query STEERS attention (as Q)
-        # but the output is the cross-attention readout (NO residual from q).
-        # Earlier code added q back as a residual, which routed position
-        # straight to the pool's output and made the JEPA target a function
-        # of centroid coordinates alone — full constant-output collapse.
+    def forward(self, event_feat, centroids, event_coords, event_kpm=None):
+        # event_feat: (B, N, D); centroids: (B, P, coord_dim);
+        # event_coords: (B, N, coord_dim) used for the locality bias;
+        # event_kpm: (B, N) bool, True at padded positions.
         if self.pos_embedder is not None:
             q = self.pos_embedder(centroids)
         else:
             q = self.q_proj(self.gff_q(centroids))
         x = self.cross(self.norm_q(q), self.norm_kv(event_feat),
+                        q_coords=centroids, k_coords=event_coords,
                         key_padding_mask=event_kpm)
         x = x + self.ffn(self.norm_f(x))
         return self.norm(x)
@@ -896,7 +899,8 @@ class BigBirdEventEncoderWithPool(nn.Module):
                  reinject_pos: bool = False,
                  side: int = 64,
                  pos_embed: str = "nerf", nerf_freqs: int = 10,
-                 fixed_pos_embedder: Optional[nn.Module] = None):
+                 fixed_pos_embedder: Optional[nn.Module] = None,
+                 local_bias_scale: float = 10.0):
         super().__init__()
         self.coord_dim     = coord_dim
         self.side          = side
@@ -923,6 +927,7 @@ class BigBirdEventEncoderWithPool(nn.Module):
                 fourier_dim=fourier_dim, fourier_scale=fourier_scale,
                 ffn_mult=ffn_mult,
                 fixed_pos_embedder=fixed_pos_embedder,
+                local_bias_scale=local_bias_scale,
             )
         else:
             self.pool = CentroidPool(
@@ -934,6 +939,7 @@ class BigBirdEventEncoderWithPool(nn.Module):
                 pos_embed=pos_embed, nerf_freqs=nerf_freqs,
                 shared_pos_embedder=self.encoder.tokenizer.gff,
                 shared_q_proj=self.encoder.tokenizer.pos_proj,
+                local_bias_scale=local_bias_scale,
             )
         for name, ranks in precompute_grid_orderings(side, ndim=coord_dim).items():
             self.register_buffer(f"_rank_{name}", ranks, persistent=False)
@@ -954,14 +960,14 @@ class BigBirdEventEncoderWithPool(nn.Module):
     def forward(self, events, centroids, event_kpm=None,
                 return_event_feat: bool = False):
         """If `return_event_feat=True`, returns per-event features (B, N, D)
-        from the encoder, skipping the CentroidPool. Used on the target side
-        of the JEPA loss to define content-aware targets via mean-pool per
-        patch — bypassing the pool removes the "h_tgt = f(centroid)" trivial
-        minimum that collapses the encoder."""
+        from the encoder, skipping the CentroidPool. Otherwise returns the
+        CentroidPool output at the provided centroids (B, P, D), now using
+        spatial-locality biased cross-attention."""
         coords = events[..., :self.coord_dim]
         signal = events[..., self.coord_dim:]
         orderings = self._orderings(coords, event_kpm)
         event_feat = self.encoder(signal, coords, orderings, key_padding_mask=event_kpm)
         if return_event_feat:
             return event_feat
-        return self.pool(event_feat, centroids, event_kpm=event_kpm)
+        return self.pool(event_feat, centroids, event_coords=coords,
+                          event_kpm=event_kpm)
