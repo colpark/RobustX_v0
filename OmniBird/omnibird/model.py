@@ -749,11 +749,20 @@ class CentroidPool(nn.Module):
     def __init__(self, d_model: int, n_heads: int = 8, dim_head: int = 32,
                  coord_dim: int = 3, fourier_dim: int = 96,
                  fourier_scale: float = 15.0, ffn_mult: int = 4,
-                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10,
+                 shared_pos_embedder=None, shared_q_proj=None):
         super().__init__()
-        self.gff_q, pos_in = _make_pos_embedder(pos_embed, coord_dim,
-                                                  fourier_dim, fourier_scale, nerf_freqs)
-        self.q_proj  = nn.Linear(pos_in, d_model)
+        # Optionally share the positional embedder + linear projection with the
+        # encoder's tokenizer so that centroid queries and event tokens live in
+        # the same d_model space from init → cross-attention is real spatial
+        # attention from step 1, not random averaging.
+        if shared_pos_embedder is not None and shared_q_proj is not None:
+            self.gff_q  = shared_pos_embedder
+            self.q_proj = shared_q_proj
+        else:
+            self.gff_q, pos_in = _make_pos_embedder(pos_embed, coord_dim,
+                                                      fourier_dim, fourier_scale, nerf_freqs)
+            self.q_proj = nn.Linear(pos_in, d_model)
         self.norm_q  = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
         self.cross   = CrossAttention(d_model, n_heads=n_heads, dim_head=dim_head)
@@ -817,6 +826,8 @@ class BigBirdEventEncoderWithPool(nn.Module):
             fourier_dim=fourier_dim, fourier_scale=fourier_scale,
             ffn_mult=ffn_mult,
             pos_embed=pos_embed, nerf_freqs=nerf_freqs,
+            shared_pos_embedder=self.encoder.tokenizer.gff,
+            shared_q_proj=self.encoder.tokenizer.pos_proj,
         )
         for name, ranks in precompute_grid_orderings(side, ndim=coord_dim).items():
             self.register_buffer(f"_rank_{name}", ranks, persistent=False)
