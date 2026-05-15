@@ -24,6 +24,9 @@ from .attention import (
     MultiHeadAttention, BigBirdSparseAttention,
     GroupedSparseAttention, CrossAttention,
 )
+from .serialization import (
+    precompute_grid_orderings, quantize_coords, invert_perm,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -673,3 +676,106 @@ class PatchOmniBirdEncoder(nn.Module):
                                             key_padding_mask=patch_kpm)
             tokens = tokens + blk["ffn"](blk["norm2"](tokens))
         return self.norm(tokens)
+
+
+# ---------------------------------------------------------------------------
+# CentroidPool — cross-attention pool with data-conditional centroid queries
+# ---------------------------------------------------------------------------
+
+class CentroidPool(nn.Module):
+    """One cross-attention block where per-instance centroids are the queries
+    and per-event features are the keys/values. Produces one latent per
+    centroid. The centroid itself is encoded only through its coordinate
+    (Gaussian Fourier features), making the pool position-aware but
+    data-conditional via the centroid positions chosen per sample.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 8, dim_head: int = 32,
+                 coord_dim: int = 3, fourier_dim: int = 96,
+                 fourier_scale: float = 15.0, ffn_mult: int = 4):
+        super().__init__()
+        self.gff_q   = GaussianFourierFeatures(coord_dim, fourier_dim, scale=fourier_scale)
+        self.q_proj  = nn.Linear(2 * fourier_dim, d_model)
+        self.norm_q  = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.cross   = CrossAttention(d_model, n_heads=n_heads, dim_head=dim_head)
+        self.norm_f  = nn.LayerNorm(d_model)
+        self.ffn     = FeedForward(d_model, mult=ffn_mult)
+        self.norm    = nn.LayerNorm(d_model)
+
+    def forward(self, event_feat, centroids, event_kpm=None):
+        # event_feat: (B, N, D); centroids: (B, P, coord_dim); event_kpm: (B, N)
+        q = self.q_proj(self.gff_q(centroids))
+        q = q + self.cross(self.norm_q(q), self.norm_kv(event_feat),
+                            key_padding_mask=event_kpm)
+        q = q + self.ffn(self.norm_f(q))
+        return self.norm(q)
+
+
+# ---------------------------------------------------------------------------
+# BigBirdEventEncoderWithPool — BigBird per-event encoder + CentroidPool
+# ---------------------------------------------------------------------------
+
+class BigBirdEventEncoderWithPool(nn.Module):
+    """Per-event BigBird sparse encoder followed by a cross-attention pool
+    that turns event features into one latent per data-conditional centroid.
+
+    Designed so a single forward pass takes (events, centroids, event_kpm) and
+    returns (B, P, D) — clean to wrap in DataParallel.
+    """
+
+    def __init__(self, d_model: int = 256, n_layers: int = 6,
+                 n_heads: int = 8, dim_head: int = 32,
+                 block_size: int = 8, window: int = 1,
+                 n_random: int = 2, n_global: int = 2,
+                 ffn_mult: int = 4,
+                 signal_dim: int = 2, coord_dim: int = 3,
+                 fourier_dim: int = 96, fourier_scale: float = 15.0,
+                 serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
+                 reinject_pos: bool = False,
+                 side: int = 64):
+        super().__init__()
+        self.coord_dim     = coord_dim
+        self.side          = side
+        self.serial_orders = tuple(serial_orders)
+        self.encoder = OmniBirdEncoder(
+            d_model=d_model, n_layers=n_layers,
+            n_heads=n_heads, dim_head=dim_head,
+            block_size=block_size, window=window,
+            n_random=n_random, n_global=n_global,
+            ffn_mult=ffn_mult,
+            signal_dim=signal_dim, coord_dim=coord_dim,
+            fourier_dim=fourier_dim, fourier_scale=fourier_scale,
+            serial_orders=serial_orders,
+            reinject_pos=reinject_pos,
+            attention_type="bigbird",
+        )
+        self.pool = CentroidPool(
+            d_model=d_model,
+            n_heads=n_heads, dim_head=dim_head,
+            coord_dim=coord_dim,
+            fourier_dim=fourier_dim, fourier_scale=fourier_scale,
+            ffn_mult=ffn_mult,
+        )
+        for name, ranks in precompute_grid_orderings(side, ndim=coord_dim).items():
+            self.register_buffer(f"_rank_{name}", ranks, persistent=False)
+
+    def _orderings(self, coords, event_kpm):
+        B, N, _ = coords.shape
+        cell_ids = quantize_coords(coords, side=self.side, value_range=(-1.0, 1.0))
+        tail_shift = event_kpm.long() * (N + 1) if event_kpm is not None else 0
+        out = {}
+        for name in self.serial_orders:
+            ranks = getattr(self, f"_rank_{name}")[cell_ids]
+            eff = ranks + tail_shift
+            perm = eff.argsort(dim=-1)
+            inv  = invert_perm(perm)
+            out[name] = {"perm": perm, "inverse": inv}
+        return out
+
+    def forward(self, events, centroids, event_kpm=None):
+        coords = events[..., :self.coord_dim]
+        signal = events[..., self.coord_dim:]
+        orderings = self._orderings(coords, event_kpm)
+        event_feat = self.encoder(signal, coords, orderings, key_padding_mask=event_kpm)
+        return self.pool(event_feat, centroids, event_kpm=event_kpm)

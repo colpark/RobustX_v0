@@ -15,6 +15,7 @@ from .model import (
     PredictorBlock, OmniBirdPredictor,
     HierarchicalEncoderBlock, PerceiverPredictor,
     Patchifier, PatchOmniBirdEncoder,
+    CentroidPool, BigBirdEventEncoderWithPool,
 )
 from .data import (
     OmniBirdEventDataset, OmniBirdPatchDataset,
@@ -42,6 +43,7 @@ __all__ = [
     "EncoderBlock", "OmniBirdEncoder", "PredictorBlock", "OmniBirdPredictor",
     "HierarchicalEncoderBlock", "PerceiverPredictor",
     "Patchifier", "PatchOmniBirdEncoder",
+    "CentroidPool", "BigBirdEventEncoderWithPool",
     # data
     "OmniBirdEventDataset", "OmniBirdPatchDataset",
     "build_loaders", "orderings_from_batch",
