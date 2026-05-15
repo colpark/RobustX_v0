@@ -253,25 +253,30 @@ class EncoderBlock(nn.Module):
         """x: (B, N, D)  N divisible by block_size
         perm:         (B, N) — permutes original→sorted-by-curve
         inverse_perm: (B, N) — inverse of perm
-        pos_emb:      (B, N, D) — positional embedding to re-inject as a residual
-                                  before attention. If None, no re-injection.
+        pos_emb:      (B, N, D) — positional embedding to inject as ATTENTION
+                                  INPUT (only). If None, no injection.
         key_padding_mask: (B, N) bool in *original* order
 
-        Re-injecting pos_emb at every layer is what makes the per-layer random
-        re-shuffling meaningful: it forces the model to rely on the true spatial
-        positional embedding rather than current sequence-position, since sequence
-        position changes layer to layer but pos_emb is the same true (y, x).
-        """
-        # Re-inject true positional embedding as a residual at this layer
-        if pos_emb is not None:
-            x = x + pos_emb
+        Pre-norm with pos as attention-input bias (NOT residual-stream accumulator):
 
-        # Gather into curve order (and gather padding mask too)
+            x_p = x_p + attn(LN(x_p + pos_emb))   # pos seen by attn; residual stays clean
+            x_p = x_p + ffn(LN(x_p))
+
+        Older code did `x = x + pos_emb` *before* gather, which permanently mutated
+        the residual stream — after L layers the stream carried L·pos_emb and the
+        encoder output was direction-dominated by position, regardless of content.
+        """
+        # Gather into curve order (and gather padding mask + pos_emb too)
         x_p = _gather_along_seq(x, perm)
         pm_p = _gather_mask(key_padding_mask, perm) if key_padding_mask is not None else None
 
-        # BigBird sparse attention in curve order
-        x_p = x_p + self.attn(self.norm1(x_p), key_padding_mask=pm_p)
+        # Pos as attention-input bias only — residual stream stays clean.
+        if pos_emb is not None:
+            pos_p = _gather_along_seq(pos_emb, perm)
+            attn_in = self.norm1(x_p + pos_p)
+        else:
+            attn_in = self.norm1(x_p)
+        x_p = x_p + self.attn(attn_in, key_padding_mask=pm_p)
 
         # FFN (position-wise, so ordering doesn't matter — still on curve order)
         x_p = x_p + self.ffn(self.norm2(x_p))
