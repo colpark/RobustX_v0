@@ -959,15 +959,25 @@ class BigBirdEventEncoderWithPool(nn.Module):
 
     def forward(self, events, centroids, event_kpm=None,
                 return_event_feat: bool = False):
-        """If `return_event_feat=True`, returns per-event features (B, N, D)
-        from the encoder, skipping the CentroidPool. Otherwise returns the
-        CentroidPool output at the provided centroids (B, P, D), now using
-        spatial-locality biased cross-attention."""
-        coords = events[..., :self.coord_dim]
-        signal = events[..., self.coord_dim:]
+        """Per-event encoder + CentroidPool.
+
+        Architectural anti-collapse: a **tokenizer skip-connection** is added
+        to the pool's input. The encoder can in principle map every event to
+        the same vector (the trivial JEPA minimum), but the tokenizer cannot —
+        different events have different (signal, coord) and therefore
+        different tokenizer outputs by construction. Adding it as a residual
+        before the pool guarantees per-event variation in the keys/values
+        regardless of what the encoder learns, so the LocalCrossAttention's
+        locality bias has *content that varies* to aggregate over.
+        """
+        coords  = events[..., :self.coord_dim]
+        signal  = events[..., self.coord_dim:]
+        # Raw tokenizer output — parameter-free guarantee of per-event variation.
+        skip    = self.encoder.tokenizer(signal, coords)         # (B, N, D)
         orderings = self._orderings(coords, event_kpm)
         event_feat = self.encoder(signal, coords, orderings, key_padding_mask=event_kpm)
         if return_event_feat:
-            return event_feat
-        return self.pool(event_feat, centroids, event_coords=coords,
+            return event_feat + skip
+        pool_kv = event_feat + skip
+        return self.pool(pool_kv, centroids, event_coords=coords,
                           event_kpm=event_kpm)
