@@ -151,10 +151,15 @@ class FixedPosEmbedder(nn.Module):
         # persistent buffer so checkpoints round-trip and reloads reproduce
         # the exact same projection (otherwise re-init would change it).
         self.register_buffer("W", W, persistent=True)
+        # Scale output by 1/sqrt(d_model) so per-dim values sit at the
+        # transformer's natural init scale (~1/sqrt(D)). Raw orthogonal-
+        # projected NeRF features have per-dim values ~0.25, contributing
+        # ~25% of token direction at init — too much for a JEPA target.
+        self.scale = 1.0 / math.sqrt(d_model)
         self.out_dim = d_model
 
     def forward(self, coords):
-        return self.nerf(coords) @ self.W.t()
+        return (self.nerf(coords) @ self.W.t()) * self.scale
 
 
 class Tokenizer(nn.Module):
@@ -438,7 +443,15 @@ class OmniBirdEncoder(nn.Module):
                 x = blk(x, perm, inv, pos_emb=pos_emb, key_padding_mask=pm)
 
         x = self.norm(x)
-        return x[:, :K_orig]    # strip padding
+        out = x[:, :K_orig]      # strip padding
+        # Explicit position residual at the output so event_feat carries usable
+        # spatial structure for any downstream cross-attention pool. Without
+        # this, position is only ever shown to internal attention (via pre-norm
+        # reinject) and the final LN'd output is mostly content — pos queries
+        # then have nothing aligned to attend to.
+        if self.reinject_pos:
+            out = out + self.compute_pos_emb(coords)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -853,14 +866,19 @@ class CentroidPool(nn.Module):
 
     def forward(self, event_feat, centroids, event_kpm=None):
         # event_feat: (B, N, D); centroids: (B, P, coord_dim); event_kpm: (B, N)
+        # Perceiver-IO style: position-derived query STEERS attention (as Q)
+        # but the output is the cross-attention readout (NO residual from q).
+        # Earlier code added q back as a residual, which routed position
+        # straight to the pool's output and made the JEPA target a function
+        # of centroid coordinates alone — full constant-output collapse.
         if self.pos_embedder is not None:
             q = self.pos_embedder(centroids)
         else:
             q = self.q_proj(self.gff_q(centroids))
-        q = q + self.cross(self.norm_q(q), self.norm_kv(event_feat),
-                            key_padding_mask=event_kpm)
-        q = q + self.ffn(self.norm_f(q))
-        return self.norm(q)
+        x = self.cross(self.norm_q(q), self.norm_kv(event_feat),
+                        key_padding_mask=event_kpm)
+        x = x + self.ffn(self.norm_f(x))
+        return self.norm(x)
 
 
 # ---------------------------------------------------------------------------
