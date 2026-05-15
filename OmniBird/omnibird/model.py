@@ -959,9 +959,17 @@ class BigBirdEventEncoderWithPool(nn.Module):
             out[name] = {"perm": perm, "inverse": inv}
         return out
 
-    def forward(self, events, centroids, event_kpm=None):
+    def forward(self, events, centroids, event_kpm=None,
+                return_event_feat: bool = False):
+        """If `return_event_feat=True`, returns per-event features (B, N, D)
+        from the encoder, skipping the CentroidPool. Used on the target side
+        of the JEPA loss to define content-aware targets via mean-pool per
+        patch — bypassing the pool removes the "h_tgt = f(centroid)" trivial
+        minimum that collapses the encoder."""
         coords = events[..., :self.coord_dim]
         signal = events[..., self.coord_dim:]
         orderings = self._orderings(coords, event_kpm)
         event_feat = self.encoder(signal, coords, orderings, key_padding_mask=event_kpm)
+        if return_event_feat:
+            return event_feat
         return self.pool(event_feat, centroids, event_kpm=event_kpm)
