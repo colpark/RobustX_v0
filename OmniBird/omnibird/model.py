@@ -116,25 +116,79 @@ def _make_pos_embedder(pos_embed: str, coord_dim: int,
     return emb, 2 * fourier_dim
 
 
-class Tokenizer(nn.Module):
-    """Per-point token = signal_proj(signal) + pos_proj(γ(coord)).
+class FixedPosEmbedder(nn.Module):
+    """Fixed (non-trainable) coordinate → d_model embedding.
 
-    For 2-D images, signal_dim=3 (RGB) and coord_dim=2 (y, x).
-    For event cameras, signal_dim=1 (polarity) and coord_dim=3 (x, y, t).
+    Pipeline:  γ_NeRF(c)  →  W·γ  (W is a frozen orthogonal matrix)
+
+    Designed to be instantiated ONCE and shared across every place that
+    consumes a position (encoder Tokenizer, encoder per-layer pos residual,
+    CentroidPool centroid query, PerceiverPredictor mask-token positioning).
+
+    Why fixed: a trainable projection lets the model collapse the position
+    signal into a position-only shortcut by tailoring different projections
+    in different modules. With one frozen projection, position is a fixed
+    input feature that the model must combine with content.
+
+    Why orthogonal: well-conditioned by construction — W has orthonormal
+    columns (since d_model > NeRF.out_dim), so it preserves angles and
+    norms of the NeRF feature subspace. Distinct positions stay distinct,
+    and norms are well-controlled at init.
+    """
+
+    def __init__(self, coord_dim: int, d_model: int,
+                 num_freqs: int = 5,
+                 max_freq_log2: Optional[int] = None,
+                 include_input: bool = True,
+                 log_sampling: bool = True):
+        super().__init__()
+        self.nerf = NerfEmbedder(coord_dim, num_freqs=num_freqs,
+                                  max_freq_log2=max_freq_log2,
+                                  include_input=include_input,
+                                  log_sampling=log_sampling)
+        W = torch.empty(d_model, self.nerf.out_dim)
+        nn.init.orthogonal_(W)
+        # persistent buffer so checkpoints round-trip and reloads reproduce
+        # the exact same projection (otherwise re-init would change it).
+        self.register_buffer("W", W, persistent=True)
+        self.out_dim = d_model
+
+    def forward(self, coords):
+        return self.nerf(coords) @ self.W.t()
+
+
+class Tokenizer(nn.Module):
+    """Per-point token = signal_proj(signal) + pos(coord).
+
+    If `fixed_pos_embedder` is provided, `pos(coord)` is computed by the shared
+    fixed embedder. Otherwise the legacy trainable γ + Linear path is used.
     """
 
     def __init__(self, d_model=256, signal_dim=3, coord_dim=2,
                  fourier_dim=96, fourier_scale=15.0,
-                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10,
+                 fixed_pos_embedder: Optional[nn.Module] = None):
         super().__init__()
-        self.gff, pos_in = _make_pos_embedder(pos_embed, coord_dim,
-                                                fourier_dim, fourier_scale, nerf_freqs)
         self.signal_proj = nn.Linear(signal_dim, d_model)
-        self.pos_proj = nn.Linear(pos_in, d_model)
+        if fixed_pos_embedder is not None:
+            assert fixed_pos_embedder.out_dim == d_model, \
+                f"fixed_pos_embedder.out_dim={fixed_pos_embedder.out_dim} != d_model={d_model}"
+            self.pos_embedder = fixed_pos_embedder
+            self.gff = None
+            self.pos_proj = None
+        else:
+            self.gff, pos_in = _make_pos_embedder(pos_embed, coord_dim,
+                                                    fourier_dim, fourier_scale, nerf_freqs)
+            self.pos_proj = nn.Linear(pos_in, d_model)
+            self.pos_embedder = None
+
+    def pos(self, coords):
+        if self.pos_embedder is not None:
+            return self.pos_embedder(coords)
+        return self.pos_proj(self.gff(coords))
 
     def forward(self, signal, coords):
-        """signal: (B, K, signal_dim); coords: (B, K, coord_dim) → tokens (B, K, D)."""
-        return self.signal_proj(signal) + self.pos_proj(self.gff(coords))
+        return self.signal_proj(signal) + self.pos(coords)
 
 
 # ---------------------------------------------------------------------------
@@ -246,11 +300,13 @@ class OmniBirdEncoder(nn.Module):
                  reinject_pos=False,
                  attention_type: str = "bigbird", group_size: int = 16,
                  pool: str = "mean", use_centroid_pos: bool = True,
-                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10,
+                 fixed_pos_embedder: Optional[nn.Module] = None):
         super().__init__()
         self.tokenizer = Tokenizer(d_model, signal_dim=signal_dim, coord_dim=coord_dim,
                                     fourier_dim=fourier_dim, fourier_scale=fourier_scale,
-                                    pos_embed=pos_embed, nerf_freqs=nerf_freqs)
+                                    pos_embed=pos_embed, nerf_freqs=nerf_freqs,
+                                    fixed_pos_embedder=fixed_pos_embedder)
         self.attention_type = attention_type
         self.group_size = group_size
         # Padding multiple depends on which attention we use.
@@ -290,13 +346,8 @@ class OmniBirdEncoder(nn.Module):
         self.reinject_pos = reinject_pos
 
     def compute_pos_emb(self, coords):
-        """pos_emb = pos_proj(γ(coords)) — same projection used by the tokenizer.
-
-        Re-using the tokenizer's pos_proj ties the input-level and per-layer
-        positional embeddings, which keeps the parameter count flat and means
-        a single set of pos weights is learned.
-        """
-        return self.tokenizer.pos_proj(self.tokenizer.gff(coords))
+        """Same positional embedding the tokenizer uses (shared mapping)."""
+        return self.tokenizer.pos(coords)
 
     @staticmethod
     def _pad_to_block_multiple(x, block_size, key_padding_mask):
@@ -559,12 +610,22 @@ class PerceiverPredictor(nn.Module):
     def __init__(self, d_model=256, d_pred=192, n_layers=4, n_heads=6, dim_head=32,
                  coord_dim=3, fourier_dim=96, fourier_scale=15.0, ffn_mult=4,
                  pos_symmetric: bool = True,
-                 pos_embed: str = "gaussian", nerf_freqs: int = 10):
+                 pos_embed: str = "gaussian", nerf_freqs: int = 10,
+                 fixed_pos_embedder: Optional[nn.Module] = None):
         super().__init__()
         self.proj_in    = nn.Linear(d_model, d_pred)
-        self.gff, pos_in = _make_pos_embedder(pos_embed, coord_dim,
-                                                fourier_dim, fourier_scale, nerf_freqs)
-        self.proj_pos   = nn.Linear(pos_in, d_pred)
+        if fixed_pos_embedder is not None:
+            assert fixed_pos_embedder.out_dim == d_pred, \
+                (f"fixed_pos_embedder.out_dim={fixed_pos_embedder.out_dim} != d_pred={d_pred}. "
+                 "Set cfg.d_pred = cfg.d_model when using a shared fixed positional embedder.")
+            self.pos_embedder = fixed_pos_embedder
+            self.gff = None
+            self.proj_pos = None
+        else:
+            self.gff, pos_in = _make_pos_embedder(pos_embed, coord_dim,
+                                                    fourier_dim, fourier_scale, nerf_freqs)
+            self.proj_pos = nn.Linear(pos_in, d_pred)
+            self.pos_embedder = None
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_pred))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.pos_symmetric = pos_symmetric
@@ -595,10 +656,16 @@ class PerceiverPredictor(nn.Module):
         ctx_tok = self.proj_in(ctx_feat)
         if self.pos_symmetric:
             assert ctx_coords is not None, "pos_symmetric=True needs ctx_coords"
-            ctx_tok = ctx_tok + self.proj_pos(self.gff(ctx_coords))
+            if self.pos_embedder is not None:
+                ctx_tok = ctx_tok + self.pos_embedder(ctx_coords)
+            else:
+                ctx_tok = ctx_tok + self.proj_pos(self.gff(ctx_coords))
 
-        # Initialize each query with its γ(coord) + mask_token
-        q = self.proj_pos(self.gff(query_coords)) + self.mask_token
+        # Initialize each query with its positional embedding + mask_token
+        if self.pos_embedder is not None:
+            q = self.pos_embedder(query_coords) + self.mask_token
+        else:
+            q = self.proj_pos(self.gff(query_coords)) + self.mask_token
 
         for blk in self.layers:
             # Cross-attn: q ← ctx_tok
@@ -750,19 +817,28 @@ class CentroidPool(nn.Module):
                  coord_dim: int = 3, fourier_dim: int = 96,
                  fourier_scale: float = 15.0, ffn_mult: int = 4,
                  pos_embed: str = "gaussian", nerf_freqs: int = 10,
-                 shared_pos_embedder=None, shared_q_proj=None):
+                 shared_pos_embedder=None, shared_q_proj=None,
+                 fixed_pos_embedder: Optional[nn.Module] = None):
         super().__init__()
-        # Optionally share the positional embedder + linear projection with the
-        # encoder's tokenizer so that centroid queries and event tokens live in
-        # the same d_model space from init → cross-attention is real spatial
-        # attention from step 1, not random averaging.
-        if shared_pos_embedder is not None and shared_q_proj is not None:
+        # Three ways to wire the centroid query positional embedding (in order
+        # of precedence): a single shared fixed embedder (preferred — matches
+        # what the encoder Tokenizer uses); the legacy "share γ+q_proj with
+        # Tokenizer" path; or a stand-alone trainable γ+q_proj.
+        if fixed_pos_embedder is not None:
+            assert fixed_pos_embedder.out_dim == d_model, \
+                f"fixed_pos_embedder.out_dim={fixed_pos_embedder.out_dim} != d_model={d_model}"
+            self.pos_embedder = fixed_pos_embedder
+            self.gff_q  = None
+            self.q_proj = None
+        elif shared_pos_embedder is not None and shared_q_proj is not None:
             self.gff_q  = shared_pos_embedder
             self.q_proj = shared_q_proj
+            self.pos_embedder = None
         else:
             self.gff_q, pos_in = _make_pos_embedder(pos_embed, coord_dim,
                                                       fourier_dim, fourier_scale, nerf_freqs)
             self.q_proj = nn.Linear(pos_in, d_model)
+            self.pos_embedder = None
         self.norm_q  = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
         self.cross   = CrossAttention(d_model, n_heads=n_heads, dim_head=dim_head)
@@ -772,7 +848,10 @@ class CentroidPool(nn.Module):
 
     def forward(self, event_feat, centroids, event_kpm=None):
         # event_feat: (B, N, D); centroids: (B, P, coord_dim); event_kpm: (B, N)
-        q = self.q_proj(self.gff_q(centroids))
+        if self.pos_embedder is not None:
+            q = self.pos_embedder(centroids)
+        else:
+            q = self.q_proj(self.gff_q(centroids))
         q = q + self.cross(self.norm_q(q), self.norm_kv(event_feat),
                             key_padding_mask=event_kpm)
         q = q + self.ffn(self.norm_f(q))
@@ -801,7 +880,8 @@ class BigBirdEventEncoderWithPool(nn.Module):
                  serial_orders=("z", "z_rev", "hilbert", "hilbert_rev"),
                  reinject_pos: bool = False,
                  side: int = 64,
-                 pos_embed: str = "nerf", nerf_freqs: int = 10):
+                 pos_embed: str = "nerf", nerf_freqs: int = 10,
+                 fixed_pos_embedder: Optional[nn.Module] = None):
         super().__init__()
         self.coord_dim     = coord_dim
         self.side          = side
@@ -818,17 +898,28 @@ class BigBirdEventEncoderWithPool(nn.Module):
             reinject_pos=reinject_pos,
             attention_type="bigbird",
             pos_embed=pos_embed, nerf_freqs=nerf_freqs,
+            fixed_pos_embedder=fixed_pos_embedder,
         )
-        self.pool = CentroidPool(
-            d_model=d_model,
-            n_heads=n_heads, dim_head=dim_head,
-            coord_dim=coord_dim,
-            fourier_dim=fourier_dim, fourier_scale=fourier_scale,
-            ffn_mult=ffn_mult,
-            pos_embed=pos_embed, nerf_freqs=nerf_freqs,
-            shared_pos_embedder=self.encoder.tokenizer.gff,
-            shared_q_proj=self.encoder.tokenizer.pos_proj,
-        )
+        if fixed_pos_embedder is not None:
+            self.pool = CentroidPool(
+                d_model=d_model,
+                n_heads=n_heads, dim_head=dim_head,
+                coord_dim=coord_dim,
+                fourier_dim=fourier_dim, fourier_scale=fourier_scale,
+                ffn_mult=ffn_mult,
+                fixed_pos_embedder=fixed_pos_embedder,
+            )
+        else:
+            self.pool = CentroidPool(
+                d_model=d_model,
+                n_heads=n_heads, dim_head=dim_head,
+                coord_dim=coord_dim,
+                fourier_dim=fourier_dim, fourier_scale=fourier_scale,
+                ffn_mult=ffn_mult,
+                pos_embed=pos_embed, nerf_freqs=nerf_freqs,
+                shared_pos_embedder=self.encoder.tokenizer.gff,
+                shared_q_proj=self.encoder.tokenizer.pos_proj,
+            )
         for name, ranks in precompute_grid_orderings(side, ndim=coord_dim).items():
             self.register_buffer(f"_rank_{name}", ranks, persistent=False)
 

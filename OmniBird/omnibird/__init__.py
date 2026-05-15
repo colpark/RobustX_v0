@@ -10,7 +10,8 @@ from .attention import (
     GroupedSparseAttention, CrossAttention, make_attention,
 )
 from .model import (
-    GaussianFourierFeatures, NerfEmbedder, Tokenizer, FeedForward,
+    GaussianFourierFeatures, NerfEmbedder, FixedPosEmbedder,
+    Tokenizer, FeedForward,
     EncoderBlock, OmniBirdEncoder,
     PredictorBlock, OmniBirdPredictor,
     HierarchicalEncoderBlock, PerceiverPredictor,
@@ -39,7 +40,8 @@ __all__ = [
     "MultiHeadAttention", "BigBirdSparseAttention",
     "GroupedSparseAttention", "CrossAttention", "make_attention",
     # model
-    "GaussianFourierFeatures", "NerfEmbedder", "Tokenizer", "FeedForward",
+    "GaussianFourierFeatures", "NerfEmbedder", "FixedPosEmbedder",
+    "Tokenizer", "FeedForward",
     "EncoderBlock", "OmniBirdEncoder", "PredictorBlock", "OmniBirdPredictor",
     "HierarchicalEncoderBlock", "PerceiverPredictor",
     "Patchifier", "PatchOmniBirdEncoder",
