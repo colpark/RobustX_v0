@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PBB-style JEPA on CIFAR10-DVS — architecture</title>
+<style>
+:root {
+  --bg: #fafaf7;
+  --fg: #1f2937;
+  --muted: #6b7280;
+  --accent: #1e40af;
+  --accent-light: #dbeafe;
+  --warn: #b45309;
+  --warn-light: #fef3c7;
+  --good: #15803d;
+  --good-light: #dcfce7;
+  --code-bg: #f3f4f6;
+  --border: #d1d5db;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-mono: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+body { font-family: var(--font-serif); background: var(--bg); color: var(--fg); line-height: 1.55; max-width: 980px; margin: 0 auto; padding: 3em 2em; }
+h1, h2, h3, h4 { font-family: var(--font-sans); font-weight: 600; line-height: 1.25; }
+h1 { font-size: 2em; margin-bottom: 0.15em; }
+h1 .subtitle { display: block; font-weight: 400; font-size: 0.55em; color: var(--muted); margin-top: 0.4em; font-family: var(--font-serif); font-style: italic; }
+h2 { font-size: 1.5em; margin-top: 2em; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.18em; margin-top: 1.5em; color: var(--accent); }
+.abstract { background: var(--accent-light); border-left: 3px solid var(--accent); padding: 1em 1.4em; margin: 1.5em 0; font-style: italic; }
+.note { background: var(--warn-light); border-left: 3px solid var(--warn); padding: 0.9em 1.3em; margin: 1em 0; font-size: 0.93em; }
+.good { background: var(--good-light); border-left: 3px solid var(--good); padding: 0.9em 1.3em; margin: 1em 0; font-size: 0.93em; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; font-family: var(--font-sans); font-size: 0.92em; }
+th, td { padding: 0.55em 0.8em; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+th { background: var(--code-bg); font-weight: 600; }
+code { font-family: var(--font-mono); background: var(--code-bg); padding: 0.08em 0.4em; border-radius: 3px; font-size: 0.92em; }
+pre { background: var(--code-bg); padding: 1em 1.2em; border-radius: 4px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.85em; line-height: 1.45; border: 1px solid var(--border); }
+.diagram { background: white; border: 1px solid var(--border); border-radius: 6px; padding: 1.5em; margin: 1em 0; text-align: center; }
+.diagram svg { max-width: 100%; height: auto; }
+ol li, ul li { margin-bottom: 0.4em; }
+.tag { display: inline-block; background: var(--accent-light); color: var(--accent); padding: 0.12em 0.6em; border-radius: 10px; font-family: var(--font-sans); font-size: 0.78em; font-weight: 600; margin-right: 0.4em; }
+.tag.novel { background: var(--good-light); color: var(--good); }
+.tag.borrowed { background: var(--code-bg); color: var(--muted); }
+.tag.future { background: var(--warn-light); color: var(--warn); }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.2em 0; }
+.footer { color: var(--muted); font-size: 0.85em; margin-top: 2em; }
+</style>
+</head>
+<body>
+
+<h1>PBB-style JEPA on CIFAR10-DVS
+  <span class="subtitle">i-JEPA-faithful self-supervised pretraining on per-event tokens</span>
+</h1>
+
+<p class="abstract">A direct port of the CIFAR-10 PBB recipe to event-camera data. Per-event BigBird sparse-attention encoder over 8192 (x, y, t, polarity) tokens, anchor-KNN multi-block masking in 3D coordinates, direct per-event target gather, smooth-L1 loss in latent space with DINO-style EMA target centering before per-token LayerNorm. The same architectural recipe as the CIFAR-10 variant; the only changes are coord_dim, signal_dim, and pool/block sizes.</p>
+
+<div class="note">
+<strong>Modality caveat.</strong> Each event token carries 1 bit of polarity (vs. 24 bits of RGB per pixel in the CIFAR-10 variant). This is closer to the per-token entropy limit where naked JEPA reliably works without further architectural defenses. Provided here as the cleanest possible event baseline for analyzing JEPA dynamics at low per-token content.
+</div>
+
+<h2>1. Architecture</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 880 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PBB CIFAR10-DVS architecture">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f2937"/>
+    </marker>
+    <style><![CDATA[
+      .box { fill: white; stroke: #1f2937; stroke-width: 1.2; }
+      .box.accent { fill: #dbeafe; stroke: #1e40af; }
+      .box.target { fill: #dcfce7; stroke: #15803d; }
+      .box.context { fill: #fef3c7; stroke: #b45309; }
+      .box.predictor { fill: #fce7f3; stroke: #be185d; }
+      .box.loss { fill: #e0e7ff; stroke: #4338ca; }
+      .label { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px; fill: #1f2937; }
+      .label.small { font-size: 10px; fill: #6b7280; }
+      .label.bold { font-weight: 700; }
+      .arrow { stroke: #1f2937; stroke-width: 1.2; fill: none; marker-end: url(#arrow); }
+      .arrow.dashed { stroke-dasharray: 4 3; stroke: #6b7280; }
+    ]]></style>
+  </defs>
+
+  <!-- INPUT -->
+  <rect class="box accent" x="280" y="20" width="320" height="50" rx="4"/>
+  <text class="label bold" x="440" y="42" text-anchor="middle">Event clip (~10⁴ events)</text>
+  <text class="label small" x="440" y="58" text-anchor="middle">→ cap/pad to 8192 events: (B, 8192, 4)  ← (x, y, t, p)</text>
+
+  <!-- HILBERT SORT -->
+  <rect class="box" x="280" y="100" width="320" height="40" rx="4"/>
+  <text class="label" x="440" y="125" text-anchor="middle">3D Hilbert-curve sort (padded events → tail)</text>
+  <line class="arrow" x1="440" y1="70" x2="440" y2="100"/>
+
+  <!-- TOKENIZER -->
+  <rect class="box" x="280" y="170" width="320" height="55" rx="4"/>
+  <text class="label bold" x="440" y="192" text-anchor="middle">Tokenizer</text>
+  <text class="label small" x="440" y="210" text-anchor="middle">signal_proj(one_hot_polarity) + pos_proj(γ_Fourier(x, y, t))</text>
+  <line class="arrow" x1="440" y1="140" x2="440" y2="170"/>
+
+  <!-- ENCODER -->
+  <rect class="box accent" x="230" y="255" width="420" height="80" rx="4"/>
+  <text class="label bold" x="440" y="278" text-anchor="middle">BigBird encoder · 6 layers</text>
+  <text class="label small" x="440" y="296" text-anchor="middle">per-layer random 3D SFC permutation · key_padding_mask threaded</text>
+  <text class="label small" x="440" y="312" text-anchor="middle">block=8, window=1, n_random=2, n_global=2</text>
+  <text class="label small" x="440" y="328" text-anchor="middle">→ per-event features (B, 8192, D)</text>
+  <line class="arrow" x1="440" y1="225" x2="440" y2="255"/>
+
+  <!-- BRANCH -->
+  <line class="arrow" x1="440" y1="335" x2="180" y2="375"/>
+  <line class="arrow" x1="440" y1="335" x2="700" y2="375"/>
+
+  <!-- CONTEXT -->
+  <rect class="box context" x="60" y="375" width="240" height="60" rx="4"/>
+  <text class="label bold" x="180" y="398" text-anchor="middle">CTX direct gather</text>
+  <text class="label small" x="180" y="416" text-anchor="middle">encoder_output[ctx_event_idx]</text>
+  <text class="label small" x="180" y="430" text-anchor="middle">(B, 2048, D)  one KNN block</text>
+
+  <!-- TARGET -->
+  <rect class="box target" x="580" y="375" width="240" height="60" rx="4"/>
+  <text class="label bold" x="700" y="398" text-anchor="middle">TGT direct gather (EMA encoder)</text>
+  <text class="label small" x="700" y="416" text-anchor="middle">target_encoder_output[tgt_event_idx]</text>
+  <text class="label small" x="700" y="430" text-anchor="middle">(B, 2048, D)  4×512 KNN-disjoint blocks</text>
+
+  <!-- TARGET CENTERING & LN -->
+  <rect class="box target" x="580" y="460" width="240" height="50" rx="4"/>
+  <text class="label bold" x="700" y="482" text-anchor="middle">TargetCenter + per-token LN</text>
+  <text class="label small" x="700" y="498" text-anchor="middle">DINO-style EMA batch-mean sub → LN</text>
+  <line class="arrow" x1="700" y1="435" x2="700" y2="460"/>
+
+  <!-- PREDICTOR -->
+  <rect class="box predictor" x="60" y="460" width="240" height="80" rx="4"/>
+  <text class="label bold" x="180" y="482" text-anchor="middle">Predictor · dense Transformer</text>
+  <text class="label small" x="180" y="498" text-anchor="middle">[ctx_tokens ‖ mask+pos(tgt_xyt)]</text>
+  <text class="label small" x="180" y="513" text-anchor="middle">4 layers · pos_symmetric=True</text>
+  <text class="label small" x="180" y="528" text-anchor="middle">→ h_pred (B, 2048, D)</text>
+  <line class="arrow" x1="180" y1="435" x2="180" y2="460"/>
+
+  <!-- LOSS -->
+  <rect class="box loss" x="345" y="540" width="190" height="32" rx="4"/>
+  <text class="label bold" x="440" y="561" text-anchor="middle">smooth_L1(h_pred, h_tgt)</text>
+  <line class="arrow" x1="300" y1="500" x2="345" y2="555"/>
+  <line class="arrow" x1="580" y1="485" x2="535" y2="555"/>
+
+  <!-- EMA arrow -->
+  <line class="arrow dashed" x1="450" y1="295" x2="600" y2="375"/>
+  <text class="label small" x="535" y="335" text-anchor="middle" fill="#6b7280">EMA</text>
+  <text class="label small" x="535" y="350" text-anchor="middle" fill="#6b7280">τ: 0.999 → 1.0</text>
+</svg>
+</div>
+
+<h2>2. Modality-specific adaptations vs. the CIFAR-10 variant</h2>
+
+<table>
+<tr><th>Aspect</th><th>CIFAR-10 (RGB pixels)</th><th>CIFAR10-DVS (this folder)</th><th>Why the change</th></tr>
+<tr><td>coord_dim</td><td>2 (y, x)</td><td>3 (x, y, t)</td><td>Time is a first-class axis for events</td></tr>
+<tr><td>signal_dim</td><td>3 (RGB)</td><td>2 (one-hot ON/OFF polarity)</td><td>Events carry only polarity</td></tr>
+<tr><td>Pool size</td><td>410 pixels (40% of 1024)</td><td>8192 events</td><td>Event clips have ~10⁴ events; cap at 8192</td></tr>
+<tr><td>Context size</td><td>100 pixels</td><td>2048 events</td><td>Scaled proportionally to pool size</td></tr>
+<tr><td>Target blocks</td><td>4 × 50 = 200</td><td>4 × 512 = 2048</td><td>Scaled proportionally</td></tr>
+<tr><td>Grid <code>side</code></td><td>32 (matches image resolution)</td><td>64 (matches DVS128 sensor with binning)</td><td>SFC ranks computed on the grid scale</td></tr>
+<tr><td>Padding</td><td>Not needed (fixed pool size)</td><td>Required — clips have variable event counts</td><td>Key-padding mask threaded through every attention layer</td></tr>
+<tr><td>Per-token content</td><td>24 bits (RGB)</td><td>1 bit (polarity)</td><td>This is the main reason the recipe is closer to its working limit on events</td></tr>
+<tr><td>Encoder / predictor / loss</td><td>Unchanged</td><td>Unchanged</td><td>Same <code>pbb_core</code> library; just different config</td></tr>
+</table>
+
+<h2>3. Why this might underperform the CIFAR-10 variant</h2>
+
+<p>The JEPA loss has two attractors:</p>
+<ol>
+<li><strong>Useful representation</strong> — encoder learns content-aware per-event features; predictor learns extrapolation; loss low because predictions match content.</li>
+<li><strong>Constant-output</strong> — encoder maps every event to the same direction; per-token LN normalizes; predictor outputs the constant; loss zero; probe at chance.</li>
+</ol>
+
+<p>What pushes gradient descent toward (1) is <strong>per-token content density</strong>. At random initialization, the encoder applied to genuinely different inputs produces genuinely different outputs <em>only if the inputs themselves differ at the token level</em>. With 1-bit polarity per event, two adjacent events with the same polarity are almost indistinguishable token-wise — the only thing differentiating them is the coordinate, which the encoder treats as a soft positional signal.</p>
+
+<p>DINO-style centering pushes the constant-direction minimum away by forcing target features to vary across the batch dimension. This is enough at CIFAR-10's 24-bit content level — the encoder's initialization-time per-token diversity is already large enough that the centering term holds. At 1-bit content the margin is thinner; whether centering alone holds is the empirical question this notebook addresses.</p>
+
+<h2>4. Why use this folder anyway</h2>
+
+<p>This is the <strong>cleanest possible PBB baseline on event data</strong> — same recipe as the working CIFAR-10 variant, no additional architectural defenses, no regularizers. It serves three purposes:</p>
+
+<ul>
+<li><strong>Diagnostic.</strong> If naked PBB collapses on events but works on CIFAR-10, that pinpoints content density (not the recipe) as the load-bearing variable. This is the cleanest test of the modality-sensitivity hypothesis.</li>
+<li><strong>Reference point.</strong> Any heavier event-SSL recipe (cross-attention readout, voxelization, temporal causality, VICReg) can be evaluated against this baseline to quantify what the addition actually buys.</li>
+<li><strong>Reproducibility.</strong> Same library, same architectural code as the CIFAR-10 variant — apples-to-apples comparison across modalities.</li>
+</ul>
+
+<h2>5. If this underperforms — concrete next steps</h2>
+
+<table>
+<tr><th>Direction</th><th>What to try</th><th>Where</th></tr>
+<tr><td><span class="tag future">Voxelize</span></td><td>Convert events to a 3-channel "event image" (ON-count / time-surface / OFF-count), run a standard MAE on it. Provably collapse-free (target is data). Closest event-camera analogue of an image SSL method.</td><td>Parent <code>OmniBird/notebooks/cifar10_dvs_eventmae.ipynb</code></td></tr>
+<tr><td><span class="tag future">Causal Temporal-JEPA</span></td><td>Sort events by t globally. Predict future-window features from past-window features. Aligns the pretext task with the sensor's physics.</td><td>Parent <code>OmniBird/notebooks/cifar10_dvs_temporal.ipynb</code></td></tr>
+<tr><td><span class="tag future">Higher-content tokens</span></td><td>Group K events into one "patch token" via mini-PointNet aggregation. Each token now carries ~K bits of polarity-density info instead of 1 bit. This is how Point-JEPA works on point clouds.</td><td>New experiment</td></tr>
+<tr><td><span class="tag future">Add VICReg variance term on targets</span></td><td>Explicit anti-collapse pressure. What Point-JEPA and V-JEPA do for sparse modalities.</td><td>Add a single term to the loss in cell 7 of the notebook</td></tr>
+<tr><td><span class="tag future">Multi-event augmentation</span></td><td>Random temporal crop, random polarity flip on a fraction of events, random spatial shift. Different views of same clip → contrastive pressure.</td><td>Modify dataset</td></tr>
+</table>
+
+<h2>6. Compared to other event-camera SSL</h2>
+
+<table>
+<tr><th>Method</th><th>Token granularity</th><th>Pretext</th><th>Anti-collapse</th><th>This vs.</th></tr>
+<tr><td>This (PBB-DVS)</td><td>Per-event (1 bit each)</td><td>i-JEPA-style multi-block</td><td>Target centering + LN, no regularizer</td><td>—</td></tr>
+<tr><td>MEM (Klenk et al., WACV 2024)</td><td>16×16 patches of voxelized "event image"</td><td>Masked patch reconstruction (BEiT-style, with a dVAE codebook)</td><td>Not needed — target is data</td><td>Stronger published baseline; lower architectural flexibility</td></tr>
+<tr><td>Event-VAE + downstream classifier</td><td>3-channel event image</td><td>VAE reconstruction</td><td>Not needed</td><td>Older; doesn't transfer as well</td></tr>
+<tr><td>Point-JEPA (Saito &amp; Poovvancheri, WACV 2025)</td><td>Patch tokens via mini-PointNet over K neighbors</td><td>i-JEPA multi-block on patch indices</td><td>Target LN; some variants add VICReg</td><td>The patch tokenization makes the recipe work where per-event doesn't</td></tr>
+<tr><td>Time-cell event modeling (TESPEC, ICCV 2025)</td><td>Spatio-temporal voxels</td><td>Masked reconstruction with temporal pretext tasks</td><td>Not needed</td><td>Stronger recipe; voxelization first</td></tr>
+</table>
+
+<h2>7. Caveats</h2>
+
+<div class="note">
+<strong>Per-event JEPA on raw 1-bit-content tokens is an active research question, not a solved benchmark.</strong> No published work runs this exact recipe on raw events; all published event-SSL either voxelizes (collapses time into bins) or aggregates events into multi-event patch tokens. The naked PBB recipe applied here is closer to a "what does JEPA look like at the lowest per-token entropy?" sanity check than to a competitive baseline.
+</div>
+
+<div class="footer">
+File: <code>architecture.html</code>. See <code>README.md</code> for usage, <code>pbb_cifar10_dvs.ipynb</code> for the training notebook, <code>pbb_core.py</code> for the model library (identical to the CIFAR-10 variant's).
+</div>
+
+</body>
+</html>

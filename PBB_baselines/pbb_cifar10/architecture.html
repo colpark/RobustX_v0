@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PBB-style JEPA on CIFAR-10 — architecture</title>
+<style>
+:root {
+  --bg: #fafaf7;
+  --fg: #1f2937;
+  --muted: #6b7280;
+  --accent: #1e40af;
+  --accent-light: #dbeafe;
+  --warn: #b45309;
+  --warn-light: #fef3c7;
+  --good: #15803d;
+  --good-light: #dcfce7;
+  --code-bg: #f3f4f6;
+  --border: #d1d5db;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-mono: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+body {
+  font-family: var(--font-serif);
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.55;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 3em 2em;
+}
+h1, h2, h3, h4 { font-family: var(--font-sans); font-weight: 600; line-height: 1.25; }
+h1 { font-size: 2em; margin-bottom: 0.15em; }
+h1 .subtitle { display: block; font-weight: 400; font-size: 0.55em; color: var(--muted); margin-top: 0.4em; font-family: var(--font-serif); font-style: italic; }
+h2 { font-size: 1.5em; margin-top: 2em; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.18em; margin-top: 1.5em; color: var(--accent); }
+h4 { font-size: 1em; margin-top: 1.2em; }
+.abstract {
+  background: var(--accent-light); border-left: 3px solid var(--accent);
+  padding: 1em 1.4em; margin: 1.5em 0; font-style: italic;
+}
+.note {
+  background: var(--warn-light); border-left: 3px solid var(--warn);
+  padding: 0.9em 1.3em; margin: 1em 0; font-size: 0.93em;
+}
+.good {
+  background: var(--good-light); border-left: 3px solid var(--good);
+  padding: 0.9em 1.3em; margin: 1em 0; font-size: 0.93em;
+}
+table { border-collapse: collapse; width: 100%; margin: 1em 0; font-family: var(--font-sans); font-size: 0.92em; }
+th, td { padding: 0.55em 0.8em; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+th { background: var(--code-bg); font-weight: 600; }
+code { font-family: var(--font-mono); background: var(--code-bg); padding: 0.08em 0.4em; border-radius: 3px; font-size: 0.92em; }
+pre { background: var(--code-bg); padding: 1em 1.2em; border-radius: 4px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.85em; line-height: 1.45; border: 1px solid var(--border); }
+.diagram { background: white; border: 1px solid var(--border); border-radius: 6px; padding: 1.5em; margin: 1em 0; text-align: center; }
+.diagram svg { max-width: 100%; height: auto; }
+ol li, ul li { margin-bottom: 0.4em; }
+.tag { display: inline-block; background: var(--accent-light); color: var(--accent); padding: 0.12em 0.6em; border-radius: 10px; font-family: var(--font-sans); font-size: 0.78em; font-weight: 600; margin-right: 0.4em; }
+.tag.novel { background: var(--good-light); color: var(--good); }
+.tag.borrowed { background: var(--code-bg); color: var(--muted); }
+.tag.future { background: var(--warn-light); color: var(--warn); }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.2em 0; }
+.footer { color: var(--muted); font-size: 0.85em; margin-top: 2em; }
+</style>
+</head>
+<body>
+
+<h1>PBB-style JEPA on CIFAR-10 (40% sparse pool)
+  <span class="subtitle">i-JEPA-faithful self-supervised pretraining for sparse-input vision</span>
+</h1>
+
+<p class="abstract">A PointBigBird-style Joint Embedding Predictive Architecture trained on a 40% random-pixel sparse pool of CIFAR-10. Per-pixel BigBird sparse-attention encoder, anchor-KNN multi-block masking, direct per-pixel target gather, smooth-L1 loss in latent space with DINO-style EMA target centering before per-token LayerNorm. No VICReg / contrastive / centering-sharpening softmax: target centering + EMA + per-token LN is sufficient at this content density (24 bits of RGB per token).</p>
+
+<h2>1. Architecture</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 880 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PBB CIFAR-10 architecture">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f2937"/>
+    </marker>
+    <style><![CDATA[
+      .box { fill: white; stroke: #1f2937; stroke-width: 1.2; }
+      .box.accent { fill: #dbeafe; stroke: #1e40af; }
+      .box.target { fill: #dcfce7; stroke: #15803d; }
+      .box.context { fill: #fef3c7; stroke: #b45309; }
+      .box.predictor { fill: #fce7f3; stroke: #be185d; }
+      .box.loss { fill: #e0e7ff; stroke: #4338ca; }
+      .label { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px; fill: #1f2937; }
+      .label.small { font-size: 10px; fill: #6b7280; }
+      .label.bold { font-weight: 700; }
+      .arrow { stroke: #1f2937; stroke-width: 1.2; fill: none; marker-end: url(#arrow); }
+      .arrow.dashed { stroke-dasharray: 4 3; stroke: #6b7280; }
+    ]]></style>
+  </defs>
+
+  <!-- INPUT -->
+  <rect class="box accent" x="320" y="20" width="240" height="50" rx="4"/>
+  <text class="label bold" x="440" y="42" text-anchor="middle">Image (3, 32, 32)</text>
+  <text class="label small" x="440" y="58" text-anchor="middle">→ sample 40% pixels (~410 per image)</text>
+
+  <!-- POOL TOKENS -->
+  <rect class="box" x="320" y="100" width="240" height="40" rx="4"/>
+  <text class="label" x="440" y="125" text-anchor="middle">pool tokens: (B, 410, 5)  ← (y, x, R, G, B)</text>
+  <line class="arrow" x1="440" y1="70" x2="440" y2="100"/>
+
+  <!-- TOKENIZER -->
+  <rect class="box" x="320" y="170" width="240" height="55" rx="4"/>
+  <text class="label bold" x="440" y="192" text-anchor="middle">Tokenizer</text>
+  <text class="label small" x="440" y="210" text-anchor="middle">signal_proj(RGB) + pos_proj(γ_Fourier(y, x))</text>
+  <line class="arrow" x1="440" y1="140" x2="440" y2="170"/>
+
+  <!-- ENCODER -->
+  <rect class="box accent" x="270" y="255" width="340" height="80" rx="4"/>
+  <text class="label bold" x="440" y="278" text-anchor="middle">BigBird encoder · 6 layers</text>
+  <text class="label small" x="440" y="296" text-anchor="middle">per-layer random SFC permutation</text>
+  <text class="label small" x="440" y="312" text-anchor="middle">block=8, window=1, n_random=2, n_global=2</text>
+  <text class="label small" x="440" y="328" text-anchor="middle">→ per-pixel features (B, 410, D)</text>
+  <line class="arrow" x1="440" y1="225" x2="440" y2="255"/>
+
+  <!-- BRANCH -->
+  <line class="arrow" x1="440" y1="335" x2="180" y2="375"/>
+  <line class="arrow" x1="440" y1="335" x2="700" y2="375"/>
+
+  <!-- CONTEXT -->
+  <rect class="box context" x="60" y="375" width="240" height="60" rx="4"/>
+  <text class="label bold" x="180" y="398" text-anchor="middle">CTX direct gather</text>
+  <text class="label small" x="180" y="416" text-anchor="middle">encoder_output[ctx_pixel_idx]</text>
+  <text class="label small" x="180" y="430" text-anchor="middle">(B, 100, D)  K_CTX=100</text>
+
+  <!-- TARGET -->
+  <rect class="box target" x="580" y="375" width="240" height="60" rx="4"/>
+  <text class="label bold" x="700" y="398" text-anchor="middle">TGT direct gather  (EMA encoder)</text>
+  <text class="label small" x="700" y="416" text-anchor="middle">target_encoder_output[tgt_pixel_idx]</text>
+  <text class="label small" x="700" y="430" text-anchor="middle">(B, 200, D)  4×50 KNN-disjoint blocks</text>
+
+  <!-- TARGET CENTERING & LN -->
+  <rect class="box target" x="580" y="460" width="240" height="50" rx="4"/>
+  <text class="label bold" x="700" y="482" text-anchor="middle">TargetCenter + per-token LN</text>
+  <text class="label small" x="700" y="498" text-anchor="middle">DINO-style EMA batch-mean sub → LN</text>
+  <line class="arrow" x1="700" y1="435" x2="700" y2="460"/>
+
+  <!-- PREDICTOR -->
+  <rect class="box predictor" x="60" y="460" width="240" height="80" rx="4"/>
+  <text class="label bold" x="180" y="482" text-anchor="middle">Predictor · dense Transformer</text>
+  <text class="label small" x="180" y="498" text-anchor="middle">[ctx_tokens ‖ mask+pos(tgt_coord)]</text>
+  <text class="label small" x="180" y="513" text-anchor="middle">4 layers · pos_symmetric=True</text>
+  <text class="label small" x="180" y="528" text-anchor="middle">→ h_pred (B, 200, D)</text>
+  <line class="arrow" x1="180" y1="435" x2="180" y2="460"/>
+
+  <!-- LOSS -->
+  <rect class="box loss" x="345" y="540" width="190" height="32" rx="4"/>
+  <text class="label bold" x="440" y="561" text-anchor="middle">smooth_L1(h_pred, h_tgt)</text>
+  <line class="arrow" x1="300" y1="500" x2="345" y2="555"/>
+  <line class="arrow" x1="580" y1="485" x2="535" y2="555"/>
+
+  <!-- EMA arrow -->
+  <line class="arrow dashed" x1="450" y1="295" x2="600" y2="375"/>
+  <text class="label small" x="535" y="335" text-anchor="middle" fill="#6b7280">EMA</text>
+  <text class="label small" x="535" y="350" text-anchor="middle" fill="#6b7280">τ: 0.999 → 1.0</text>
+</svg>
+</div>
+
+<p>Two key facts about this architecture:</p>
+<ul>
+<li><strong>No learned compression / "pool" / "readout" layer.</strong> Targets and context features are direct gathers from the per-token encoder output. The encoder's job is to produce contextualized per-token features; the JEPA loss operates on those features directly.</li>
+<li><strong>Position-symmetric predictor.</strong> Both context tokens (in the predictor's keys) and target queries receive the same positional embedding γ_Fourier(coord), so the predictor's attention has consistent spatial grounding on both sides.</li>
+</ul>
+
+<h2>2. Recipe details</h2>
+
+<h3>Dataset / masking</h3>
+<table>
+<tr><th>Step</th><th>Description</th></tr>
+<tr><td>Pool sampling</td><td>For each image, a per-image fixed random permutation selects 410 of the 1024 pixels. Coords normalized to [-1, 1]², signals to [-1, 1]³ RGB.</td></tr>
+<tr><td>Hilbert sort</td><td>Pool pixels sorted by 2D Hilbert-curve rank, so spatially nearby pixels are contiguous in the token sequence (BigBird's window then is spatially local).</td></tr>
+<tr><td>Target blocks (training)</td><td>4 anchors picked uniformly in the pool. Each anchor grows a block of its K_TGT_PER_BLOCK=50 nearest pool members (in 2D coords). Subsequent blocks exclude previously-claimed pixels (disjoint). 200 total target positions per sample.</td></tr>
+<tr><td>Context block</td><td>One anchor in the remaining pool. K_CTX=100 nearest pool members in remaining pool. Disjoint from all targets.</td></tr>
+<tr><td>Test path</td><td>Only the first K_POOL/2 = 205 pool pixels exposed (20% of image); no targets. The probe must classify from this 20% partial view.</td></tr>
+</table>
+
+<h3>Models</h3>
+<table>
+<tr><th>Component</th><th>Configuration</th></tr>
+<tr><td>Encoder</td><td>6 BigBird layers, d_model=256, 8 heads × 32 dim_head. Block size 8, window 1, 2 random + 2 global blocks per layer. Per-layer random space-filling-curve permutation.</td></tr>
+<tr><td>Target encoder</td><td>Architecturally identical to the online encoder. Initialized from a deepcopy. Updated only via EMA with momentum ramp 0.999 → 1.0 over the full schedule. No gradient.</td></tr>
+<tr><td>Predictor</td><td>4 dense-attention Transformer layers, d_pred=192, 6 heads × 32 dim_head. Input is the concatenation of context tokens (with γ position added if pos_symmetric=True) and mask tokens at target coords. Reads off the target positions; output projected back to d_model.</td></tr>
+<tr><td>Target centering</td><td>EMA of the per-feature batch mean of gathered raw target features, momentum 0.9. Subtracted before per-token LayerNorm.</td></tr>
+<tr><td>Loss</td><td>Smooth-L1 (Huber, β=1) between h_pred and centered + LN'd h_tgt.</td></tr>
+</table>
+
+<h3>Training</h3>
+<table>
+<tr><th>Setting</th><th>Value</th></tr>
+<tr><td>Optimizer</td><td>AdamW, lr=2e-4, weight_decay=0</td></tr>
+<tr><td>LR schedule</td><td>5-epoch linear warmup → cosine decay to 0 over remaining epochs</td></tr>
+<tr><td>Batch size</td><td>64</td></tr>
+<tr><td>Epochs</td><td>1000 (probe every 10)</td></tr>
+<tr><td>EMA momentum</td><td>0.999 → 1.0 linear ramp over the full schedule</td></tr>
+<tr><td>Linear probe</td><td>2 epochs during training every 10 epochs (quick); 30 epochs at the end on best checkpoint (final)</td></tr>
+</table>
+
+<h2>3. Compared to canonical i-JEPA</h2>
+
+<table>
+<tr><th>Aspect</th><th>i-JEPA (image)</th><th>This (PBB-CIFAR10)</th></tr>
+<tr><td>Token granularity</td><td>16×16 ViT patches (~768 RGB pixels per token)</td><td>Per-pixel tokens from a 40% sparse pool</td></tr>
+<tr><td>Encoder backbone</td><td>Vision Transformer (dense self-attention)</td><td>BigBird block-sparse attention with random SFC permutation per layer</td></tr>
+<tr><td>Position embedding</td><td>Learned per-patch index (learnable lookup table)</td><td>Gaussian Fourier features γ(coord) + trainable Linear</td></tr>
+<tr><td>Masking</td><td>4–6 rectangular target blocks on the patch grid</td><td>4 KNN-disjoint blocks anchored at random pool pixels</td></tr>
+<tr><td>Target representation</td><td>Per-patch target encoder output, gathered at target indices</td><td>Per-pixel target encoder output, gathered at target indices</td></tr>
+<tr><td>Target normalization</td><td>Per-token LayerNorm before loss</td><td>DINO-style centering → per-token LayerNorm before loss</td></tr>
+<tr><td>Loss</td><td>Smooth-L1 (β=1) in latent space</td><td>Same</td></tr>
+<tr><td>EMA momentum</td><td>0.996 → 1.0</td><td>0.999 → 1.0</td></tr>
+<tr><td>Predictor</td><td>Narrow ViT, mask tokens + per-patch pos embedding</td><td>Narrow dense Transformer, mask tokens + γ(target_coord), pos_symmetric=True</td></tr>
+<tr><td>Anti-collapse regularizer</td><td>None</td><td>None (centering serves the role at this content density)</td></tr>
+</table>
+
+<h2>4. Novel contributions vs. i-JEPA</h2>
+
+<p>The core JEPA loss + EMA + multi-block masking is unchanged. What's specifically new here:</p>
+
+<h3><span class="tag novel">Novel</span> 1. Multi-curve space-filling-curve permutations per encoder layer</h3>
+<p>Standard BigBird operates on a fixed sequence order; in 2D/3D we sort tokens by Hilbert or Z-order before attention. Our encoder picks a <em>different</em> SFC permutation per layer (uniformly random from {z, z-rev, hilbert, hilbert-rev}). Each layer's block-sparse attention covers a different local-neighborhood pattern, and stacked depth produces a globally-connected receptive field at BigBird's per-layer cost. This is essential when running BigBird on sparse 2D/3D inputs, where there is no single "canonical" sequence order.</p>
+
+<h3><span class="tag novel">Novel</span> 2. Anchor-KNN-disjoint multi-block masking on sparse pools</h3>
+<p>i-JEPA's rectangular target blocks assume a regular grid. On a 40% sparse pool there is no grid, so block extent must be defined by distance. Our masking picks 4 anchors uniformly in the pool and grows each block by k-nearest pool members in 2D coordinates, with successive blocks excluding previously-claimed pixels. Context comes from one anchor in the remaining pool. This produces locally-coherent target regions that don't overlap, which is the property i-JEPA's rectangular blocks have.</p>
+
+<h3><span class="tag novel">Novel</span> 3. DINO-style EMA target centering before per-token LayerNorm</h3>
+<p>This is the load-bearing anti-collapse mechanism. Per-token LayerNorm alone (the i-JEPA recipe) allows the "all targets point in the same direction across the batch" failure mode on sparse inputs. Subtracting an EMA of the per-feature batch mean before LN removes that minimum without adding any regularizer to the loss. Specifically:</p>
+<pre>target_center.update(h_tgt_raw)                                # EMA: c ← 0.9·c + 0.1·mean(h_tgt_raw)
+h_tgt = F.layer_norm(target_center(h_tgt_raw), (D,))          # subtract c, then LN per token</pre>
+<p>This addition is 5 lines and replaces what VICReg / centering+sharpening softmax / variance-covariance regularizers do in heavier recipes.</p>
+
+<h3><span class="tag novel">Novel</span> 4. <code>pos_symmetric=True</code> predictor</h3>
+<p>Both the predictor's context tokens (keys/values) and its mask-token queries receive an explicit γ(coord) positional embedding before the dense Transformer. Standard i-JEPA only adds position to queries. Symmetric position avoids a positional-information asymmetry between context and target sides that would otherwise force the predictor to bridge two different coordinate frames.</p>
+
+<h3><span class="tag borrowed">Borrowed from i-JEPA / DINO / BigBird</span></h3>
+<ul>
+<li>JEPA loss formulation (smooth-L1 in latent space, EMA target, stop-grad).</li>
+<li>Multi-block masking discipline (disjoint context and target sets).</li>
+<li>BigBird block-sparse attention (window + random + global blocks).</li>
+<li>DINO target centering operator.</li>
+<li>Gaussian Fourier feature positional encoding.</li>
+</ul>
+
+<h2>5. Why this works (the theory of operation)</h2>
+
+<p>The JEPA loss has several low-loss minima:</p>
+<ol>
+<li><strong>Useful representation minimum.</strong> Encoder produces content-aware per-pixel features; predictor learns to extrapolate spatially; loss is low because predictions actually match content.</li>
+<li><strong>Constant-output minimum.</strong> Encoder maps every input to the same direction; predictor outputs that direction; per-token LN makes them all unit-norm; loss is zero. Probe is at chance.</li>
+</ol>
+
+<p>What pushes gradient descent toward (1) rather than (2):</p>
+
+<ul>
+<li><strong>High per-token content (24 bits of RGB per pixel).</strong> Random encoder weights applied to genuinely different RGB pixels already produce different output vectors at initialization. The constant minimum is far from init in weight space.</li>
+<li><strong>DINO-style centering before LN.</strong> If the encoder collapsed to constant direction <em>v</em>, the EMA batch mean would equal <em>v</em>, centering would zero it out, and per-token LN would amplify residual noise into different per-token directions across the batch. The constant minimum is no longer at zero loss.</li>
+<li><strong>200 target positions per sample.</strong> Dense supervision: every batch produces gradients at 200 specific spatial locations, forcing the encoder to produce position-discriminating features.</li>
+<li><strong>EMA stop-grad.</strong> Standard JEPA stability mechanism — the target is a slowly-moving target the online encoder chases.</li>
+</ul>
+
+<h2>6. What would strengthen performance further</h2>
+
+<table>
+<tr><th>Idea</th><th>Why it might help</th><th>Effort</th></tr>
+<tr><td><span class="tag future">Augmentation</span> Spatial augmentation (random crops in [28, 32], horizontal flip, color jitter)</td><td>JEPA + multi-crop augmentation is the load-bearing combination in DINOv2. Forces invariance to nuisance variation. Single highest-impact upgrade on image SSL.</td><td>Low (~20 lines)</td></tr>
+<tr><td><span class="tag future">CLS token</span> Add a learnable global [CLS] token to the encoder, jointly distill it across views (iBOT-style)</td><td>Patch-level JEPA learns local features but weak global ones. A [CLS] objective explicitly trains a global representation that helps linear probe.</td><td>Medium</td></tr>
+<tr><td><span class="tag future">Multi-crop</span> Pretrain on 2 global views + 4–6 small local views per sample (DINOv2)</td><td>Equivalent to data augmentation but specifically designed for SSL. Each batch effectively becomes 8 perturbed views of the same image.</td><td>Medium</td></tr>
+<tr><td><span class="tag future">Larger encoder</span> d_model 256 → 384 or 512, 6 → 12 layers</td><td>Standard scaling. CIFAR-10 is small; bigger encoders typically overfit, but with strong augmentation they can substantially improve probe.</td><td>Trivial config change; needs longer training</td></tr>
+<tr><td><span class="tag future">Probe with attentive pooling instead of mean-pool</span></td><td>Mean-pooling discards local structure. Learned attentive pooling (a small attention head over context token features) typically gives 5–10 pp lift.</td><td>Low</td></tr>
+<tr><td><span class="tag future">Fine-tune protocol</span> Unfreeze the encoder, MLP head, layer-wise LR decay</td><td>Linear probe systematically under-reports what the encoder learned. Fine-tuning usually gives 10–25 pp lift over linear probe on the same encoder.</td><td>Medium</td></tr>
+<tr><td><span class="tag future">Pretrain on CIFAR-100 / TinyImageNet, probe on CIFAR-10</span></td><td>Bigger / more diverse pretraining set generally produces stronger features. Same architecture, different pretraining set.</td><td>Low (swap dataset)</td></tr>
+<tr><td><span class="tag future">Pretrain longer</span> 1000 → 5000 epochs</td><td>JEPA's linear probe improves slowly past the apparent loss plateau. Many published JEPA recipes train for 500–800 ep on small datasets and 1500+ on ImageNet.</td><td>Trivial; compute-bound</td></tr>
+<tr><td><span class="tag future">Cross-attention readout for the probe</span></td><td>Even if the JEPA loss doesn't use one, the probe head can use a small cross-attention readout to combine per-pixel features more carefully. Often a 5–10 pp lift on top of mean-pool.</td><td>Low</td></tr>
+</table>
+
+<h2>7. Caveats and honest limitations</h2>
+
+<div class="note">
+<strong>Linear probe on CIFAR-10 with sparse pretraining has a real ceiling.</strong> The pretraining task only sees 40% of pixels and the test path sees 20%. The probe is fundamentally evaluating "can a partial view of a 32×32 image classify into 10 classes". Published numbers for SSL methods on CIFAR-10 with no augmentation (the cleanest comparison) typically land in the 30–60% linear-probe range. With strong augmentation and longer pretraining, this can push past 70%.
+</div>
+
+<div class="note">
+<strong>The recipe is i-JEPA + sparse-input adaptations + target centering — not a fundamentally new SSL idea.</strong> The novel content is the integration: BigBird sparse encoder, KNN multi-block masking, target centering for sparse inputs. These are reasonable engineering choices for the sparse-input regime, not new SSL principles.
+</div>
+
+<div class="footer">
+File: <code>architecture.html</code>. See <code>README.md</code> for usage, <code>pbb_cifar10.ipynb</code> for the training notebook, <code>pbb_core.py</code> for the model library.
+</div>
+
+</body>
+</html>
