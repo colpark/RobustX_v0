@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Iterator
 import math
+import os
 
 import numpy as np
 import torch
@@ -564,7 +565,7 @@ def gather_target_features(g_tgt: torch.Tensor, tgt_pool_pos: torch.Tensor) -> t
 def save_atomic(state, path):
     tmp = path + ".tmp"
     torch.save(state, tmp)
-    os.replace(tmp, path) if False else (__import__("os").replace(tmp, path))
+    os.replace(tmp, path)
 
 
 def short_params(m):
