@@ -392,7 +392,19 @@ def precompute_fps_knn_cached(
         nbr_idx_all[i] = nbrs.numpy()
     elapsed = _time.time() - t0
     print(f"  computed in {elapsed:.1f}s; saving to {cache_path}")
+    # Atomic write: np.savez appends ".npz" to STRING paths, so we pass a
+    # file handle instead (handles are written to verbatim). Then os.replace
+    # the temp file onto the final cache path.
     tmp = cache_path + ".tmp"
-    np.savez(tmp, centroid_idx_all=centroid_idx_all, nbr_idx_all=nbr_idx_all)
+    with open(tmp, "wb") as f:
+        np.savez(f, centroid_idx_all=centroid_idx_all, nbr_idx_all=nbr_idx_all)
     os.replace(tmp, cache_path)
+    # Best-effort cleanup of any stale leftover from an earlier broken write
+    # (when savez was passed a string and auto-appended ".npz")
+    stale = cache_path + ".tmp.npz"
+    if os.path.exists(stale):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
     return centroid_idx_all, nbr_idx_all
