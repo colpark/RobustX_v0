@@ -65,6 +65,7 @@ from vit_fps_core import (
     TargetCenter, ema_update, make_momentum_schedule,
     jepa_loss, short_params, save_atomic,
     farthest_point_sample, knn_indices,
+    precompute_fps_knn_cached,
 )
 from rope_patch_core import (
     RoPEPatchifier, RoPEViTEncoder, RoPEViTPredictor,
@@ -636,7 +637,8 @@ print(f"base_within={BASE_WITHIN}  base_cross={BASE_CROSS}")
 # =============================================================================
 md(r"""## 9. Dataset — same FPS+KNN pipeline as `vit_fps_cifar10`""")
 code(r"""class FPSPatchCIFAR10(Dataset):
-    def __init__(self, base, train=True, pool_seed=0, precompute_seed=42):
+    def __init__(self, base, train=True, pool_seed=0, precompute_seed=42,
+                 cache_tag=None):
         self.base = base
         self.train = train
         self.N_pix = IMAGE_SIZE * IMAGE_SIZE
@@ -652,21 +654,17 @@ code(r"""class FPSPatchCIFAR10(Dataset):
         )
         self.coords_all = torch.stack([ys, xs], dim=-1).view(self.N_pix, 2).float()
 
-        print(f"  precomputing FPS+KNN for {len(base)} samples...")
-        t0 = time.time()
-        torch.manual_seed(precompute_seed)
-        centroid_idx_all = np.zeros((len(base), N_PATCHES), dtype=np.int64)
-        nbr_idx_all      = np.zeros((len(base), N_PATCHES, K_NEIGH), dtype=np.int64)
-        for i in range(len(base)):
-            pc = self.coords_all[self.pool_idx[i]].unsqueeze(0)
-            cen_idx = farthest_point_sample(pc, N_PATCHES).squeeze(0)
-            cen_coords = pc[0, cen_idx]
-            nbrs = knn_indices(cen_coords.unsqueeze(0), pc, K_NEIGH).squeeze(0)
-            centroid_idx_all[i] = cen_idx.numpy()
-            nbr_idx_all[i]      = nbrs.numpy()
-        self.centroid_idx_all = centroid_idx_all
-        self.nbr_idx_all      = nbr_idx_all
-        print(f"  done in {time.time()-t0:.1f}s")
+        if cache_tag is None:
+            cache_tag = f"cifar10_ps{pool_seed}"
+        self.centroid_idx_all, self.nbr_idx_all = precompute_fps_knn_cached(
+            coords_all=self.coords_all,
+            pool_idx=self.pool_idx,
+            n_patches=N_PATCHES,
+            k_neigh=K_NEIGH,
+            seed=precompute_seed,
+            cache_dir="./cache_fps_knn",
+            tag=cache_tag,
+        )
 
     def __len__(self): return len(self.base)
 

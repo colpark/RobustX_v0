@@ -323,3 +323,76 @@ def save_atomic(state, path):
     tmp = path + ".tmp"
     torch.save(state, tmp)
     os.replace(tmp, path)
+
+
+# ===========================================================================
+# Cached FPS+KNN precomputation — shared by all FPS-based notebooks
+# ===========================================================================
+
+def precompute_fps_knn_cached(
+    coords_all: torch.Tensor,
+    pool_idx: np.ndarray,
+    n_patches: int,
+    k_neigh: int,
+    seed: int = 42,
+    cache_dir: str = "./cache_fps_knn",
+    tag: str = "",
+):
+    """Precompute FPS centroids + K-NN groups for every sample. Cached to disk.
+
+    The cache key is built from `(N_samples, pool_size, n_patches, k_neigh,
+    seed, tag)`, so any config change generates a fresh file. Cache files are
+    `.npz` archives containing `centroid_idx_all` and `nbr_idx_all`.
+
+    Args
+    ----
+    coords_all : (N_pix, D) tensor with all per-pixel coords (e.g. 32x32x2).
+    pool_idx   : (N_samples, K_pool) int64 — which pixels are in each sample's pool.
+    n_patches  : FPS centroid count.
+    k_neigh    : KNN size per patch.
+    seed       : torch RNG seed (FPS picks the first centroid randomly).
+    cache_dir  : where to write/read the cache.
+    tag        : extra string in the cache filename (e.g. "train" / "test").
+
+    Returns (centroid_idx_all, nbr_idx_all) as np.int64 arrays.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    N_samples, K_pool = pool_idx.shape
+    cache_key = (
+        f"fpsknn_{tag}_N{N_samples}_pool{K_pool}_patches{n_patches}"
+        f"_knn{k_neigh}_seed{seed}.npz"
+    )
+    cache_path = os.path.join(cache_dir, cache_key)
+
+    if os.path.exists(cache_path):
+        try:
+            data = np.load(cache_path)
+            centroid_idx_all = data["centroid_idx_all"]
+            nbr_idx_all = data["nbr_idx_all"]
+            if (centroid_idx_all.shape == (N_samples, n_patches)
+                and nbr_idx_all.shape == (N_samples, n_patches, k_neigh)):
+                print(f"  [fps_knn cache HIT] loaded {cache_path}")
+                return centroid_idx_all, nbr_idx_all
+            print(f"  [fps_knn cache STALE] shape mismatch, recomputing")
+        except Exception as e:
+            print(f"  [fps_knn cache READ FAIL] {e}; recomputing")
+
+    print(f"  [fps_knn cache MISS] computing FPS+KNN for {N_samples} samples...")
+    import time as _time
+    t0 = _time.time()
+    torch.manual_seed(seed)
+    centroid_idx_all = np.zeros((N_samples, n_patches), dtype=np.int64)
+    nbr_idx_all = np.zeros((N_samples, n_patches, k_neigh), dtype=np.int64)
+    for i in range(N_samples):
+        pc = coords_all[pool_idx[i]].unsqueeze(0)
+        cen_idx = farthest_point_sample(pc, n_patches).squeeze(0)
+        cen_coords = pc[0, cen_idx]
+        nbrs = knn_indices(cen_coords.unsqueeze(0), pc, k_neigh).squeeze(0)
+        centroid_idx_all[i] = cen_idx.numpy()
+        nbr_idx_all[i] = nbrs.numpy()
+    elapsed = _time.time() - t0
+    print(f"  computed in {elapsed:.1f}s; saving to {cache_path}")
+    tmp = cache_path + ".tmp"
+    np.savez(tmp, centroid_idx_all=centroid_idx_all, nbr_idx_all=nbr_idx_all)
+    os.replace(tmp, cache_path)
+    return centroid_idx_all, nbr_idx_all

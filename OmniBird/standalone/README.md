@@ -13,7 +13,17 @@ This folder is **copy-paste portable**. It does not depend on the parent `omnibi
 | `vit_fps_cifar10.ipynb` | ViT-FPS JEPA on CIFAR-10: FPS centroids + K-NN patches → mini-PointNet → ViT. Contiguous-context-far-from-targets masking. |
 | `rope_patch_core.py` | RoPE Patch JEPA modules: `RoPEPatchifier` (Non-Uniform DFT aggregation), `CentroidRoPEMultiHeadAttention`, `RoPEViTEncoder`, `RoPEViTPredictor`. Implements the two-level rotary design. |
 | `rope_patch_cifar10.ipynb` | RoPE Patch JEPA on CIFAR-10 with rich step-by-step visualizations of (1) rotary content rotation, (2) NUDFT aggregation, (3) the spatial-info-loss problem of relative positions, (4) the two-level RoPE fix, (5) within- vs cross-patch scale mismatch, then training. |
+| `hrr_patch_core.py` | HRR Patch JEPA: NumPy `bind`/`bundle`/`unbind` primitives, Fractional Power Encoding, time-domain reference `HRRPatchifierTime`, and aliases for the training classes (HRR with FPE = RoPE-NUDFT in FFT, so the training architecture is reused). |
+| `hrr_patch_cifar10.ipynb` | HRR Patch JEPA on CIFAR-10 with visualizations of (1) the three primitives, (2) FPE position vectors as unitary elements, (3) the composition law `bind(p(x), p(y)) = p(x+y)`, (4) patch summary, (5) **unbinding** — recover individual events from the summary, (6) capacity analysis, then training. |
 | `_build_*.py` | Generator scripts for each notebook. |
+
+## FPS+KNN cache
+
+All FPS-based notebooks share `precompute_fps_knn_cached` (in `vit_fps_core.py`).
+The first run computes FPS centroids + K-NN groups for every CIFAR-10 image (≈ minutes
+for 50K samples) and writes the result to `./cache_fps_knn/*.npz`. Subsequent runs
+are instant. Cache files are keyed by `(N_samples, pool_size, n_patches, k_neigh,
+precompute_seed, tag)`; any config change auto-invalidates and recomputes.
 
 ## Architecture
 
