@@ -9,8 +9,11 @@ This folder is **copy-paste portable**. It does not depend on the parent `omnibi
 | `pbb_core.py` | Self-contained library: Tokenizer, BigBird sparse attention, encoder, dense predictor, EMA target, DINO-style target centering, smooth-L1 loss, Hilbert/Morton space-filling curves. ~580 lines. |
 | `pbb_cifar10.ipynb` | PBB v2 recipe on CIFAR-10 (40% sparse pixel pool). 410 per-pixel tokens, 200 targets per sample, direct gather. The high-confidence baseline. |
 | `pbb_cifar10_dvs.ipynb` | Same recipe ported to CIFAR10-DVS event-camera data. 8192-event pool, 2048 targets per sample. Lower per-token entropy (1-bit polarity vs 24-bit RGB) makes this closer to JEPA's limit; provided as the cleanest possible baseline. |
-| `_build_pbb_cifar10.py` | Generator script for `pbb_cifar10.ipynb`. |
-| `_build_pbb_cifar10_dvs.py` | Generator script for the DVS notebook. |
+| `vit_fps_core.py` | FPS+KNN patch construction, mini-PointNet patchifier, NeRF γ pos embedding, dense ViT encoder, dense predictor. |
+| `vit_fps_cifar10.ipynb` | ViT-FPS JEPA on CIFAR-10: FPS centroids + K-NN patches → mini-PointNet → ViT. Contiguous-context-far-from-targets masking. |
+| `rope_patch_core.py` | RoPE Patch JEPA modules: `RoPEPatchifier` (Non-Uniform DFT aggregation), `CentroidRoPEMultiHeadAttention`, `RoPEViTEncoder`, `RoPEViTPredictor`. Implements the two-level rotary design. |
+| `rope_patch_cifar10.ipynb` | RoPE Patch JEPA on CIFAR-10 with rich step-by-step visualizations of (1) rotary content rotation, (2) NUDFT aggregation, (3) the spatial-info-loss problem of relative positions, (4) the two-level RoPE fix, (5) within- vs cross-patch scale mismatch, then training. |
+| `_build_*.py` | Generator scripts for each notebook. |
 
 ## Architecture
 
