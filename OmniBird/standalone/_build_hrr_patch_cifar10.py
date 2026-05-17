@@ -86,48 +86,120 @@ print(f"GPUs visible = {torch.cuda.device_count()}  using = {N_GPUS}  DataParall
 # =============================================================================
 md(r"""## 1. The three HRR primitives
 
-Pick two random vectors `a` and `b` of length 16. Visualize each primitive:
+Pick a random content vector `a` and a position vector `b` of length 16.
+Visualize each primitive:
 
 - **bind** mixes them via circular convolution.
-- **bundle** (sum) combines two binds into one summary vector.
+- **bundle** (sum) combines bound items into one summary vector.
 - **unbind** (approximate inverse of bind) recovers one component back.
+
+**Crucial detail: `b` must be unitary** — that is, every Fourier coefficient
+must have magnitude 1: `|FFT(b)_l| = 1 ∀ l`. Why? In the frequency domain,
+bind is `FFT(a)·FFT(b)` and unbind is multiplication by `conj(FFT(b))`.
+Together they give `|FFT(b)|² · FFT(a)`. For perfect recovery we need
+`|FFT(b)|² = 1` at every frequency.
+
+We illustrate this twice — first with a **non-unitary** `b` (random Gaussian
+— recovery is awful), then with a **unitary** `b` (random phases — recovery
+is exact).
 """)
 code(r"""rng = np.random.RandomState(7)
 N = 16
 a = rng.randn(N)
-b = rng.randn(N)
 
-bound  = hrr_bind_np(a, b)
-unbnd  = hrr_unbind_np(bound, b)            # should recover ≈ a
+# ── Variant 1: NON-unitary b (just random Gaussian) ──────────────────────────
+b_naive = rng.randn(N)
 
-fig, axes = plt.subplots(1, 4, figsize=(16, 3.5))
+bound_naive  = hrr_bind_np(a, b_naive)
+unbnd_naive  = hrr_unbind_np(bound_naive, b_naive)
+err_naive = np.abs(a - unbnd_naive).max()
+cos_naive = (a @ unbnd_naive) / (np.linalg.norm(a) * np.linalg.norm(unbnd_naive) + 1e-12)
+fft_mag_naive = np.abs(np.fft.fft(b_naive))
+
+# ── Variant 2: UNITARY b (random phases, |FFT| = 1 forced) ───────────────────
+# Build the FULL complex FFT with Hermitian symmetry: FFT(b)_l = exp(j θ_l),
+# where θ_0 = 0 (DC real), θ_{N/2} = 0 (Nyquist real),
+# and θ_{N-l} = −θ_l for the remaining modes.
+theta_full = np.zeros(N)
+half = N // 2
+theta_pos = rng.uniform(-np.pi, np.pi, size=half - 1)   # l = 1, ..., N/2-1
+theta_full[1:half] = theta_pos
+theta_full[half+1:] = -theta_pos[::-1]
+fft_b = np.exp(1j * theta_full)
+b_unitary = np.real(np.fft.ifft(fft_b))                 # imag ≈ 0 by Hermitian symmetry
+fft_mag_unit = np.abs(np.fft.fft(b_unitary))
+assert np.allclose(fft_mag_unit, 1.0, atol=1e-10), (
+    f"unitarity broken: max |FFT(b)| deviation = {np.abs(fft_mag_unit - 1).max():.2e}"
+)
+
+bound_unit = hrr_bind_np(a, b_unitary)
+unbnd_unit = hrr_unbind_np(bound_unit, b_unitary)
+err_unit = np.abs(a - unbnd_unit).max()
+cos_unit = (a @ unbnd_unit) / (np.linalg.norm(a) * np.linalg.norm(unbnd_unit) + 1e-12)
+
+# ── Plot ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 4, figsize=(16, 7))
+
+# Row 1: non-unitary b
 for ax, vec, title in zip(
-    axes,
-    [a, b, bound, unbnd],
-    ["(a) content vector  a",
-     "(b) position vector  b",
-     "(c) bind(a, b) = a ⊛ b\n(elements all mixed)",
-     "(d) unbind(c, b) ≈ a\n(circular convolution with b⁻¹)"]):
+    axes[0],
+    [a, b_naive, bound_naive, unbnd_naive],
+    ["content  a",
+     "position  b  (random Gaussian)",
+     "bind(a, b)",
+     f"unbind  →  cosine={cos_naive:.2f}  ✗"]):
     ax.bar(range(N), vec, color='C0')
-    ax.set_xticks(range(N)); ax.set_ylim(-3, 3)
     ax.axhline(0, color='k', lw=0.4)
-    ax.set_title(title, fontsize=10)
+    ax.set_title(title, fontsize=9)
     ax.grid(alpha=0.2, axis='y')
+axes[0, 3].bar(range(N), a, color='none', edgecolor='C3', lw=1.5, label='true a')
+axes[0, 3].legend(fontsize=8)
+axes[0, 0].set_ylabel("NON-unitary b\n(recovery FAILS)", fontsize=10, color='C3', weight='bold')
 
-# Add overlay of original a on the unbind plot
-axes[3].bar(range(N), a, color='none', edgecolor='C3', lw=1.5, label='true a')
-axes[3].legend(fontsize=8)
+# Row 2: unitary b
+for ax, vec, title in zip(
+    axes[1],
+    [a, b_unitary, bound_unit, unbnd_unit],
+    ["content  a",
+     "position  b  (unitary: |FFT(b)|=1)",
+     "bind(a, b)",
+     f"unbind  →  cosine={cos_unit:.4f}  ✓"]):
+    ax.bar(range(N), vec, color='C0')
+    ax.axhline(0, color='k', lw=0.4)
+    ax.set_title(title, fontsize=9)
+    ax.grid(alpha=0.2, axis='y')
+axes[1, 3].bar(range(N), a, color='none', edgecolor='C2', lw=1.5, label='true a')
+axes[1, 3].legend(fontsize=8)
+axes[1, 0].set_ylabel("UNITARY b\n(recovery EXACT)", fontsize=10, color='C2', weight='bold')
+
 plt.tight_layout(); plt.show()
 
-# Numerical check
-err = np.abs(a - unbnd).max()
-cos = (a @ unbnd) / (np.linalg.norm(a) * np.linalg.norm(unbnd) + 1e-12)
-print(f"unbind(bind(a,b), b) recovers a with: max_err={err:.4f}, cosine={cos:.4f}")
+# ── FFT magnitude comparison ─────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(11, 3.5))
+ax.plot(range(N), fft_mag_naive, 'o-', color='C3', lw=2,
+         label=f'|FFT(b_naive)| — varies wildly  →  recovery cosine = {cos_naive:.2f}')
+ax.plot(range(N), fft_mag_unit, 's-', color='C2', lw=2,
+         label=f'|FFT(b_unitary)| ≡ 1            →  recovery cosine = {cos_unit:.4f}')
+ax.axhline(1.0, color='k', ls=':', lw=0.8)
+ax.set_xlabel("FFT mode index l"); ax.set_ylabel("|FFT(b)_l|")
+ax.set_title("Why unitarity matters: bind+unbind multiplies FFT by |FFT(b)|².\n"
+             "Non-uniform magnitudes corrupt the recovery; unit magnitudes preserve it exactly.")
+ax.legend(loc='upper right'); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+
+print(f"NON-unitary b:  max_err={err_naive:.4f},  cosine={cos_naive:.4f}   (FAILS)")
+print(f"UNITARY  b:      max_err={err_unit:.2e},   cosine={cos_unit:.6f}   (EXACT)")
 """)
-md(r"""**Note.** Recovery is *exact* when the position vector `b` is **unitary**
-(|FFT(b)| = 1 for all frequencies). For a generic random `b`, recovery is
-approximate. The next section shows how to construct unitary position vectors
-explicitly via Fractional Power Encoding.
+md(r"""**Reading.** With a non-unitary `b`, some frequency bands are amplified
+hundreds of times by the `|FFT(b)|²` factor while others are damped to near
+zero — recovery is dominated by whichever band the noise happened to land in.
+With a unitary `b`, every band is preserved equally and `a` comes back
+exactly (cosine = 1 up to floating-point).
+
+This is exactly why HRR position vectors must be unitary. The next section
+shows how to construct continuous families of unitary position vectors via
+**Fractional Power Encoding**, which additionally gives us the composition
+law `p(x) ⊛ p(y) = p(x+y)`.
 """)
 
 
