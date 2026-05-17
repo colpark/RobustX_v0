@@ -227,9 +227,11 @@ phases[1:1 + active_count] = 30.0 ** (-np.arange(active_count) * 2 / N)
 xs = np.linspace(-1.0, 1.0, 9)
 fig, axes = plt.subplots(2, 1, figsize=(13, 6))
 
-# Top: heatmap of p(x) as x varies
+# Top: heatmap of p(x) as x varies — vectorized call, returns (len(xs), N)
 ax = axes[0]
-pos_grid = np.stack([fpe_pos_vec_np(x, N, phases) for x in xs], axis=0)
+pos_grid = fpe_pos_vec_np(xs, N, phases)
+# Defensive: squeeze any spurious singleton dim from older core versions
+pos_grid = np.asarray(pos_grid).reshape(len(xs), N)
 im = ax.imshow(pos_grid, aspect='auto', cmap='RdBu_r',
                 extent=(0, N, xs[-1], xs[0]))
 ax.set_xlabel("vector index"); ax.set_ylabel("coord  x")
@@ -263,10 +265,11 @@ under binding. Numerically verify by binding `p(0.3)` with `p(-0.7)` and
 comparing to `p(-0.4)`.
 """)
 code(r"""x1, x2 = 0.3, -0.7
-p1 = fpe_pos_vec_np(x1, N, phases)
-p2 = fpe_pos_vec_np(x2, N, phases)
+# Vectorize: pass an array of 3 coords and unpack
+pq = fpe_pos_vec_np(np.array([x1, x2, x1 + x2]), N, phases)   # (3, N)
+pq = np.asarray(pq).reshape(3, N)
+p1, p2, p_sum = pq[0], pq[1], pq[2]
 p_bind = hrr_bind_np(p1, p2)
-p_sum  = fpe_pos_vec_np(x1 + x2, N, phases)
 
 fig, axes = plt.subplots(1, 4, figsize=(16, 3.5))
 for ax, vec, title in zip(
@@ -311,8 +314,10 @@ rng2 = np.random.RandomState(11)
 contents = rng2.randn(K, N) * 0.4
 xs_evt   = rng2.uniform(-0.8, 0.8, size=K)
 
-# Build each c_i ⊛ p(x_i)
-pos_vecs = [fpe_pos_vec_np(x, N, phases) for x in xs_evt]
+# Build each c_i ⊛ p(x_i) — vectorize the FPE call
+pos_arr = fpe_pos_vec_np(xs_evt, N, phases)                    # (K, N)
+pos_arr = np.asarray(pos_arr).reshape(K, N)
+pos_vecs = [pos_arr[i] for i in range(K)]
 bound    = [hrr_bind_np(c, p) for c, p in zip(contents, pos_vecs)]
 S        = hrr_bundle_np(*bound)
 
@@ -423,7 +428,7 @@ for ki, K in enumerate(Ks):
             ph[1:1 + active_count] = 30.0 ** (-np.arange(active_count) * 2 / N)
             contents_c = rng_cap.randn(K, N) * 0.4
             xs_c       = rng_cap.uniform(-1, 1, size=K)
-            pos_c      = np.stack([fpe_pos_vec_np(x, N, ph) for x in xs_c], axis=0)
+            pos_c      = np.asarray(fpe_pos_vec_np(xs_c, N, ph)).reshape(K, N)
             bound_c    = np.stack([hrr_bind_np(contents_c[i], pos_c[i]) for i in range(K)], axis=0)
             S_c        = bound_c.sum(axis=0)
             # Recover each event, average the cosines
