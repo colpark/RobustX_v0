@@ -58,8 +58,7 @@ def hrr_bundle_np(*items: np.ndarray) -> np.ndarray:
     return np.sum(np.stack(items, axis=0), axis=0)
 
 
-def fpe_pos_vec_np(x: float | np.ndarray, n_modes: int,
-                   phases: np.ndarray) -> np.ndarray:
+def fpe_pos_vec_np(x, n_modes: int, phases: np.ndarray) -> np.ndarray:
     """Fractional Power Encoding — encode a continuous coord as a unitary vector.
 
     Position vector at coord x is `b^x` where `b` is a fixed base unitary
@@ -79,19 +78,24 @@ def fpe_pos_vec_np(x: float | np.ndarray, n_modes: int,
 
     Returns
     -------
-    p(x) : shape (..., n_modes) real unitary vector(s)
+    p(x) : shape (n_modes,) for scalar x, or (..., n_modes) for array x.
     """
-    x = np.asarray(x)
+    x_arr = np.asarray(x, dtype=np.float64)
+    scalar_input = x_arr.ndim == 0
+    if scalar_input:
+        x_arr = x_arr.reshape(1)
     L = n_modes // 2 + 1
     assert phases.shape == (L,), f"phases must be shape ({L},), got {phases.shape}"
-    # FFT-domain construction: |FFT(p)_l| = 1 for all l
-    # Broadcasting: x can be (...,) and phases is (L,), so FFT is (..., L)
-    fft_p = np.exp(1j * phases[None, ...] * x[..., None])
-    # Force DC + Nyquist to be real (== 1) for Hermitian symmetry
+    # Broadcast: x_arr shape (..., ) and phases (L,) → fft_p shape (..., L)
+    fft_p = np.exp(1j * x_arr[..., None] * phases)
+    # Force DC + Nyquist to be real for Hermitian symmetry (real output)
     fft_p[..., 0] = 1.0
     if n_modes % 2 == 0:
         fft_p[..., -1] = 1.0
-    return np.fft.irfft(fft_p, n=n_modes, axis=-1)
+    result = np.fft.irfft(fft_p, n=n_modes, axis=-1)
+    if scalar_input:
+        result = result[0]
+    return result
 
 
 # ===========================================================================
