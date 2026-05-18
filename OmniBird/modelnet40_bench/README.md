@@ -42,6 +42,34 @@ jupyter notebook modelnet40_bench.ipynb
 # (downloads ~400MB of ModelNet40 HDF5 on first run; cached thereafter)
 ```
 
+### If the auto-download fails (proxy / firewall / 503)
+
+On clusters that gate outbound traffic, the auto-download may fail with
+something like `Tunnel connection failed: 503 Service Unavailable`. Two
+ways around it:
+
+**Option A — manually place the zip and re-run.** From any machine with
+web access:
+
+```bash
+wget https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip
+# scp / rsync / move it to the cluster, then:
+mv modelnet40_ply_hdf5_2048.zip ~/data/modelnet40_ply_hdf5_2048.zip
+```
+
+Re-run the notebook cell — the function detects the local zip and
+extracts it without trying to download.
+
+**Option B — point at a pre-extracted folder via env var.** If you
+already have `modelnet40_ply_hdf5_2048/` somewhere else:
+
+```bash
+export MODELNET40_DIR=/path/to/modelnet40_ply_hdf5_2048
+# (the directory must contain shape_names.txt and the ply_data_*.h5 files)
+```
+
+then start Jupyter from the same shell and run the notebook.
+
 Two 100-epoch training runs at batch=32, D_MODEL=192, 6-layer encoder.
 On a single modern GPU each run takes ~30–60 min depending on FPS+KNN
 precompute caching. Both runs together: about 1–2 hours.

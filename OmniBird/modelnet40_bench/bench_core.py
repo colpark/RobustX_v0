@@ -90,28 +90,107 @@ class ModelNet40Classifier(nn.Module):
 # ===========================================================================
 
 MODELNET40_URL = "https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip"
-MODELNET40_DIR_DEFAULT = os.path.expanduser("~/data/modelnet40_ply_hdf5_2048")
+MODELNET40_DIR_DEFAULT = os.environ.get(
+    "MODELNET40_DIR",
+    os.path.expanduser("~/data/modelnet40_ply_hdf5_2048"),
+)
 
 
-def download_modelnet40(target_dir: str = MODELNET40_DIR_DEFAULT) -> str:
+def _print_manual_instructions(zip_path: str, marker: str, last_err: Exception | None = None):
+    msg = [
+        "",
+        "=" * 78,
+        "  ModelNet40 auto-download failed (likely a proxy/firewall issue).",
+    ]
+    if last_err is not None:
+        msg.append(f"  Last error: {last_err}")
+    msg += [
+        "",
+        "  MANUAL DOWNLOAD INSTRUCTIONS",
+        "  ----------------------------",
+        "  1. From any machine with web access, download the zip:",
+        f"       wget {MODELNET40_URL}",
+        "     (or visit the URL in a browser; the file is ~400MB)",
+        "",
+        "  2. Place the zip at:",
+        f"       {zip_path}",
+        "     and re-run this cell — it will detect and extract automatically.",
+        "",
+        "  3. Or, if you already have the extracted folder somewhere, set:",
+        "       export MODELNET40_DIR=/path/to/modelnet40_ply_hdf5_2048",
+        f"     (the target must contain  shape_names.txt  → currently missing: {marker})",
+        "",
+        "=" * 78,
+        "",
+    ]
+    print("\n".join(msg))
+
+
+def download_modelnet40(target_dir: str = MODELNET40_DIR_DEFAULT,
+                        urls: list[str] | None = None) -> str:
     """Download + unzip the PointNet++ preprocessed ModelNet40 (~400MB).
-    Returns the data directory."""
+
+    Robustness:
+      - Honors `MODELNET40_DIR` env var (caller can point to a pre-extracted dir).
+      - Detects a manually-placed zip at `<parent>/modelnet40_ply_hdf5_2048.zip`
+        and extracts it without re-downloading.
+      - Tries a list of mirror URLs and falls back to clear manual instructions
+        if all of them fail (e.g. behind a proxy that blocks the host).
+    """
     marker = os.path.join(target_dir, "shape_names.txt")
     if os.path.exists(marker):
         print(f"  ModelNet40 already at {target_dir}")
         return target_dir
+
     parent = os.path.dirname(target_dir)
     os.makedirs(parent, exist_ok=True)
     zip_path = os.path.join(parent, "modelnet40_ply_hdf5_2048.zip")
-    print(f"  downloading ModelNet40 (~400MB) from {MODELNET40_URL}")
-    urlretrieve(MODELNET40_URL, zip_path)
-    print(f"  extracting to {parent}")
-    with ZipFile(zip_path, "r") as z:
-        z.extractall(parent)
-    os.remove(zip_path)
-    assert os.path.exists(marker), f"download/extract failed; missing {marker}"
-    print(f"  ready at {target_dir}")
-    return target_dir
+
+    # Detect a manually-placed zip — skip download entirely
+    if os.path.exists(zip_path):
+        print(f"  found local zip at {zip_path} ({os.path.getsize(zip_path) / 1e6:.1f} MB); extracting")
+        try:
+            with ZipFile(zip_path, "r") as z:
+                z.extractall(parent)
+        except Exception as e:
+            _print_manual_instructions(zip_path, marker, last_err=e)
+            raise RuntimeError(f"failed to extract {zip_path}: {e}")
+        if os.path.exists(marker):
+            print(f"  ready at {target_dir}")
+            return target_dir
+        else:
+            _print_manual_instructions(zip_path, marker)
+            raise RuntimeError(f"extracted but {marker} is missing")
+
+    # Try downloading from each candidate URL
+    urls = urls or [MODELNET40_URL]
+    last_err = None
+    for url in urls:
+        try:
+            print(f"  downloading from {url}  (~400MB)")
+            urlretrieve(url, zip_path)
+            print(f"  extracting to {parent}")
+            with ZipFile(zip_path, "r") as z:
+                z.extractall(parent)
+            try: os.remove(zip_path)
+            except OSError: pass
+            if os.path.exists(marker):
+                print(f"  ready at {target_dir}")
+                return target_dir
+        except Exception as e:
+            last_err = e
+            print(f"  download from {url} failed: {type(e).__name__}: {e}")
+            # Remove partial zip so a subsequent local-zip path isn't fooled
+            if os.path.exists(zip_path):
+                try: os.remove(zip_path)
+                except OSError: pass
+            continue
+
+    _print_manual_instructions(zip_path, marker, last_err=last_err)
+    raise RuntimeError(
+        f"all download attempts failed; last error: {last_err}. "
+        f"See manual download instructions above."
+    )
 
 
 def load_modelnet40(root: str = MODELNET40_DIR_DEFAULT, train: bool = True):
