@@ -63,7 +63,7 @@ import matplotlib.pyplot as plt
 
 from bench_core import (
     FlexibleViTEncoder, ModelNet40Classifier,
-    PointNetPatchifier, RoPEPatchifier,
+    PointNetPatchifier, RoPEPatchifier, HRRPatchifierTime,
     download_modelnet40, load_modelnet40,
     precompute_fps_knn_modelnet,
     augment_pointcloud, normalize_to_unit_sphere,
@@ -217,7 +217,17 @@ code(r"""def build_model(aggregator_name: str):
             signal_dim=SIGNAL_DIM, coord_dim=COORD_DIM, d_model=D_MODEL,
         )
     elif aggregator_name == "rope":
+        # Axial RoPE: explicit complex-pair rotation in d_model channels
         patchifier = RoPEPatchifier(
+            signal_dim=SIGNAL_DIM, coord_dim=COORD_DIM, d_model=D_MODEL,
+            base=BASE_WITHIN, agg="mean",
+        )
+    elif aggregator_name == "hrr":
+        # HRR time-domain: rfft → multiply by exp(j·ω·rel) → irfft per axis.
+        # Mathematically equivalent to RoPE-NUDFT but the per-channel layout
+        # differs (rfft modes vs interleaved real/imag pairs). Tests whether
+        # the implementation detail is load-bearing.
+        patchifier = HRRPatchifierTime(
             signal_dim=SIGNAL_DIM, coord_dim=COORD_DIM, d_model=D_MODEL,
             base=BASE_WITHIN, agg="mean",
         )
@@ -232,14 +242,18 @@ code(r"""def build_model(aggregator_name: str):
     return classifier
 
 
-# Quick sanity: both models have the same param count except for the patchifier
+# Sanity: each model has the same param count except for the patchifier
 m_pn   = build_model("pointnet")
 m_rope = build_model("rope")
-print(f"PointNet aggregator: total {short_params(m_pn)}")
-print(f"  patchifier alone:  {short_params(m_pn.encoder.patchifier)}")
-print(f"RoPE aggregator:     total {short_params(m_rope)}")
-print(f"  patchifier alone:  {short_params(m_rope.encoder.patchifier)}")
-print(f"  (encoder + classifier are byte-identical between the two)")
+m_hrr  = build_model("hrr")
+print(f"PointNet aggregator:     total {short_params(m_pn)}")
+print(f"  patchifier alone:      {short_params(m_pn.encoder.patchifier)}")
+print(f"RoPE aggregator (axial): total {short_params(m_rope)}")
+print(f"  patchifier alone:      {short_params(m_rope.encoder.patchifier)}")
+print(f"HRR aggregator (time):   total {short_params(m_hrr)}")
+print(f"  patchifier alone:      {short_params(m_hrr.encoder.patchifier)}")
+print(f"\n  (encoder + classifier are byte-identical across all three;")
+print(f"   only the patchifier differs)")
 """)
 
 
@@ -325,45 +339,74 @@ code(r"""hist_pointnet = train_one_model("pointnet", epochs=EPOCHS)
 
 
 # =============================================================================
-md(r"""## 9. Train RoPE/HRR aggregator""")
+md(r"""## 9. Train RoPE aggregator (axial complex-pair rotation)""")
 code(r"""hist_rope = train_one_model("rope", epochs=EPOCHS)
 """)
 
 
 # =============================================================================
-md(r"""## 10. Head-to-head comparison""")
+md(r"""## 9.5. Train HRR aggregator (time-domain rfft/irfft)
+
+Mathematically equivalent to RoPE in §9 — same NUDFT in different bases.
+The point of training this third model is to **check whether the
+implementation detail matters at all** for downstream accuracy. If RoPE
+and HRR end up within run-to-run noise of each other, that confirms the
+two are interchangeable in practice (as the math predicts). If they
+differ meaningfully, then per-channel layout (rfft modes vs interleaved
+real/imag pairs) interacts with optimization in some way worth tracing.
+""")
+code(r"""hist_hrr = train_one_model("hrr", epochs=EPOCHS)
+""")
+
+
+# =============================================================================
+md(r"""## 10. Three-way comparison""")
 code(r"""fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
 ax = axes[0]
-ax.plot(hist_pointnet["test_acc"], 'o-', color='C0', lw=2, label=f"PointNet (best={hist_pointnet['best_test']*100:.2f}%)")
-ax.plot(hist_rope["test_acc"],     's-', color='C3', lw=2, label=f"RoPE/HRR (best={hist_rope['best_test']*100:.2f}%)")
+ax.plot(hist_pointnet["test_acc"], 'o-', color='C0', lw=2,
+         label=f"PointNet         (best={hist_pointnet['best_test']*100:.2f}%)")
+ax.plot(hist_rope["test_acc"],     's-', color='C3', lw=2,
+         label=f"RoPE (axial)     (best={hist_rope['best_test']*100:.2f}%)")
+ax.plot(hist_hrr["test_acc"],      '^-', color='C2', lw=2,
+         label=f"HRR (time-domain)(best={hist_hrr['best_test']*100:.2f}%)")
 ax.set_xlabel("epoch"); ax.set_ylabel("test accuracy")
 ax.set_title("ModelNet40 test accuracy")
-ax.legend(); ax.grid(alpha=0.3)
+ax.legend(fontsize=9); ax.grid(alpha=0.3)
 
 ax = axes[1]
 ax.plot(hist_pointnet["train_loss"], 'o-', color='C0', lw=2, label="PointNet")
-ax.plot(hist_rope["train_loss"],     's-', color='C3', lw=2, label="RoPE/HRR")
+ax.plot(hist_rope["train_loss"],     's-', color='C3', lw=2, label="RoPE (axial)")
+ax.plot(hist_hrr["train_loss"],      '^-', color='C2', lw=2, label="HRR (time-domain)")
 ax.set_xlabel("epoch"); ax.set_ylabel("train loss")
 ax.set_title("Training loss")
-ax.legend(); ax.grid(alpha=0.3)
+ax.legend(fontsize=9); ax.grid(alpha=0.3)
 plt.tight_layout(); plt.show()
 
-# Summary table
-print(f"\n{'='*48}")
+print(f"\n{'='*56}")
 print(f"  Final best test accuracy")
-print(f"{'='*48}")
-print(f"  PointNet aggregator:  {hist_pointnet['best_test']*100:.2f}%")
-print(f"  RoPE/HRR aggregator:  {hist_rope['best_test']*100:.2f}%")
-delta = (hist_rope['best_test'] - hist_pointnet['best_test']) * 100
-print(f"  Δ (RoPE − PointNet):  {delta:+.2f} pts")
-print(f"{'='*48}")
+print(f"{'='*56}")
+print(f"  PointNet aggregator:         {hist_pointnet['best_test']*100:.2f}%")
+print(f"  RoPE aggregator (axial):     {hist_rope['best_test']*100:.2f}%")
+print(f"  HRR aggregator (time):       {hist_hrr['best_test']*100:.2f}%")
+d_rope = (hist_rope['best_test'] - hist_pointnet['best_test']) * 100
+d_hrr  = (hist_hrr['best_test']  - hist_pointnet['best_test']) * 100
+d_hr_r = (hist_hrr['best_test']  - hist_rope['best_test'])     * 100
+print(f"  Δ (RoPE − PointNet):         {d_rope:+.2f} pts")
+print(f"  Δ (HRR  − PointNet):         {d_hrr:+.2f} pts")
+print(f"  Δ (HRR  − RoPE):             {d_hr_r:+.2f} pts   ← should be ~0")
+print(f"{'='*56}")
 print()
 print("Interpretation guide:")
-print("  Δ > +1.5  →  RoPE clearly wins; the aggregator matters here.")
-print("  -1.0 ≤ Δ ≤ +1.5 → effectively a tie within run-to-run noise.")
-print("  Δ < -1.0  →  PointNet wins; max-pool's feature-selection has the right prior")
-print("              for this regime, or RoPE's spectral prior is hurting somehow.")
+print("  PointNet vs RoPE/HRR:")
+print("    Δ > +1.5  →  spectral aggregator wins; matters here.")
+print("    -1 ≤ Δ ≤ +1.5 → effective tie within run noise.")
+print("    Δ < -1     →  PointNet's max-pool prior is right for this regime.")
+print()
+print("  RoPE vs HRR (should match):")
+print("    |Δ| ≤ 1   →  expected; implementations are equivalent.")
+print("    |Δ| > 1   →  per-channel layout interacts with optimization")
+print("                  more than the math predicts.")
 """)
 
 
@@ -389,18 +432,20 @@ code(r"""def per_class_accuracy(aggregator_name):
 
 acc_pn   = per_class_accuracy("pointnet")
 acc_rope = per_class_accuracy("rope")
-diff = acc_rope - acc_pn
+acc_hrr  = per_class_accuracy("hrr")
+diff = acc_rope - acc_pn   # use RoPE-PointNet to define the sort order
 order = np.argsort(diff)
 
-fig, ax = plt.subplots(figsize=(14, 8))
+fig, ax = plt.subplots(figsize=(14, 9))
 xs = np.arange(40)
-bar_w = 0.4
-ax.barh(xs - bar_w/2, acc_pn[order]   * 100, bar_w, color='C0', label='PointNet')
-ax.barh(xs + bar_w/2, acc_rope[order] * 100, bar_w, color='C3', label='RoPE/HRR')
+bar_w = 0.27
+ax.barh(xs - bar_w,   acc_pn[order]   * 100, bar_w, color='C0', label='PointNet')
+ax.barh(xs,           acc_rope[order] * 100, bar_w, color='C3', label='RoPE (axial)')
+ax.barh(xs + bar_w,   acc_hrr[order]  * 100, bar_w, color='C2', label='HRR (time)')
 ax.set_yticks(xs); ax.set_yticklabels([CLASS_NAMES[i] for i in order], fontsize=7)
 ax.set_xlabel("per-class test accuracy (%)")
-ax.set_title("Per-class accuracy — classes sorted by RoPE−PointNet difference\n"
-             "(top = PointNet wins; bottom = RoPE wins)")
+ax.set_title("Per-class accuracy — classes sorted by (RoPE − PointNet)\n"
+             "(top: PointNet wins; bottom: RoPE wins; HRR overlay should track RoPE closely)")
 ax.legend(loc='lower right'); ax.grid(alpha=0.3, axis='x')
 plt.tight_layout(); plt.show()
 """)

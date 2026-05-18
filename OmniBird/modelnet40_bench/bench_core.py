@@ -29,6 +29,7 @@ from vit_fps_core import (
     short_params, save_atomic,
 )
 from rope_patch_core import RoPEPatchifier
+from hrr_patch_core import HRRPatchifierTime
 
 
 # ===========================================================================
