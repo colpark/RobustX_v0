@@ -1,0 +1,412 @@
+"""Attention modules: vanilla multi-head + BigBird block-sparse.
+
+`MultiHeadAttention` is plain dense scaled-dot-product attention with an
+optional key-padding mask. `BigBirdSparseAttention` implements the
+block-sparse pattern from Zaheer et al. 2020 in PyTorch using
+`index_select` / `gather` — no custom kernels, but compute is
+O(N · (2W+1+G+R) · B) instead of O(N²).
+
+The two classes share Q/K/V projections (same signature) so a model can
+swap between them. Set `equivalent_to_dense=True` in BigBird to bypass
+the sparse path and call dense attention (useful for testing).
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Vanilla dense attention (reference)
+# ---------------------------------------------------------------------------
+
+class MultiHeadAttention(nn.Module):
+    """Standard scaled-dot-product attention with optional key-padding mask."""
+
+    def __init__(self, dim, n_heads=8, dim_head=32, bias_qkv=False):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.to_qkv = nn.Linear(dim, inner * 3, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+
+    def _split_heads(self, x):
+        B, N, _ = x.shape
+        return x.view(B, N, self.n_heads, self.dim_head).transpose(1, 2)
+
+    def forward(self, x, key_padding_mask=None):
+        """x: (B, N, D); key_padding_mask: (B, N) bool, True at padding."""
+        B, N, _ = x.shape
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = self._split_heads(q)               # (B, H, N, Dh)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        scores = torch.einsum("bhnd,bhmd->bhnm", q, k) * self.scale
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(
+                key_padding_mask.view(B, 1, 1, N), float("-inf")
+            )
+        attn = F.softmax(scores, dim=-1)
+        # Rows where every key is masked yield NaN (0/0). Zero them out — the
+        # query producing such a row is itself padded, so its output is unused.
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        out = torch.einsum("bhnm,bhmd->bhnd", attn, v)             # (B, H, N, Dh)
+        out = out.transpose(1, 2).contiguous().view(B, N, -1)       # (B, N, H*Dh)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
+# BigBird block-sparse attention
+# ---------------------------------------------------------------------------
+
+class BigBirdSparseAttention(nn.Module):
+    """Block-sparse BigBird attention.
+
+    Sequence (length N, must be a multiple of `block_size`) is divided into
+    `num_blocks = N / block_size` blocks. Each *query block* attends to:
+        * `(2*window + 1)` blocks centered on itself (clamped at boundaries),
+        * `n_global` "global" blocks (default: first and last),
+        * `n_random` randomly sampled blocks (fresh sample per forward).
+
+    The same set of attended *block indices* is reused across all queries
+    inside a block, so we gather K/V once per query block.
+
+    Total cost: O(N * K_attended * dim_head) where
+        K_attended = (2W+1 + G + R) * block_size
+    vs O(N²) for dense. Set `equivalent_to_dense=True` to bypass the sparse
+    path entirely (useful for testing & ablation).
+    """
+
+    def __init__(
+        self,
+        dim,
+        n_heads=8,
+        dim_head=32,
+        block_size=32,
+        window=1,
+        n_random=2,
+        n_global=2,
+        bias_qkv=False,
+        equivalent_to_dense=False,
+    ):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.block_size = block_size
+        self.window = window
+        self.n_random = n_random
+        self.n_global = n_global
+        self.equivalent_to_dense = equivalent_to_dense
+        self.to_qkv = nn.Linear(dim, inner * 3, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+        # Cached attended-block-index pattern, recomputed on shape change
+        self._cached_nb = None
+        self._cached_static = None  # window + global indices (deterministic)
+
+    # ------------------------------------------------------------------
+    # Static pattern: window + globals (no randomness, can be cached)
+    # ------------------------------------------------------------------
+    def _static_pattern(self, num_blocks, device):
+        if self._cached_nb == num_blocks and self._cached_static is not None \
+                and self._cached_static.device == device:
+            return self._cached_static
+        b = torch.arange(num_blocks, device=device)
+        win = torch.arange(-self.window, self.window + 1, device=device)
+        win_idx = (b.unsqueeze(1) + win.unsqueeze(0)).clamp(0, num_blocks - 1)   # (NB, 2W+1)
+        if self.n_global == 2:
+            globals_ = torch.tensor([0, num_blocks - 1], device=device).unsqueeze(0).expand(num_blocks, -1)
+        elif self.n_global == 1:
+            globals_ = torch.zeros(num_blocks, 1, device=device, dtype=torch.long)
+        else:
+            globals_ = torch.arange(self.n_global, device=device).unsqueeze(0).expand(num_blocks, -1)
+        static = torch.cat([win_idx, globals_], dim=1).contiguous()              # (NB, 2W+1 + G)
+        self._cached_nb = num_blocks
+        self._cached_static = static
+        return static
+
+    def _attended_pattern(self, num_blocks, device, generator=None):
+        static = self._static_pattern(num_blocks, device)
+        if self.n_random > 0:
+            rand_idx = torch.randint(
+                0, num_blocks, (num_blocks, self.n_random),
+                device=device, generator=generator,
+            )
+            return torch.cat([static, rand_idx], dim=1)                          # (NB, KH)
+        return static
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def _split_heads(self, x):
+        B, N, _ = x.shape
+        return x.view(B, N, self.n_heads, self.dim_head).transpose(1, 2)
+
+    def _dense_forward(self, q, k, v, key_padding_mask):
+        scores = torch.einsum("bhnd,bhmd->bhnm", q, k) * self.scale
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(
+                key_padding_mask.view(q.size(0), 1, 1, -1), float("-inf")
+            )
+        attn = F.softmax(scores, dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        return torch.einsum("bhnm,bhmd->bhnd", attn, v)
+
+    def forward(self, x, key_padding_mask=None):
+        """x: (B, N, D); N must be divisible by `block_size`.
+
+        key_padding_mask: (B, N) bool, True at padding positions.
+        """
+        B, N, _ = x.shape
+        BS = self.block_size
+        assert N % BS == 0, f"N={N} must be divisible by block_size={BS}"
+
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = self._split_heads(q)                          # (B, H, N, Dh)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        if self.equivalent_to_dense:
+            out = self._dense_forward(q, k, v, key_padding_mask)
+            out = out.transpose(1, 2).contiguous().view(B, N, -1)
+            return self.to_out(out)
+
+        # Block-sparse path
+        NB = N // BS
+        H = self.n_heads
+        Dh = self.dim_head
+
+        q_b = q.reshape(B, H, NB, BS, Dh)
+        k_b = k.reshape(B, H, NB, BS, Dh)
+        v_b = v.reshape(B, H, NB, BS, Dh)
+
+        attended = self._attended_pattern(NB, x.device)   # (NB, KH)
+        KH = attended.shape[1]
+
+        flat = attended.reshape(-1)                       # (NB*KH,)
+        # Gather K, V blocks per query block.  k_b indexed on block dim (=2).
+        k_sel = k_b[:, :, flat, :, :].reshape(B, H, NB, KH * BS, Dh)
+        v_sel = v_b[:, :, flat, :, :].reshape(B, H, NB, KH * BS, Dh)
+
+        scores = torch.einsum("bhnqd,bhnkd->bhnqk", q_b, k_sel) * self.scale   # (B, H, NB, BS, KH*BS)
+
+        if key_padding_mask is not None:
+            pm = key_padding_mask.view(B, NB, BS)                       # (B, NB, BS)
+            pm_sel = pm[:, flat, :].reshape(B, NB, KH * BS)             # (B, NB, KH*BS)
+            scores = scores.masked_fill(
+                pm_sel.unsqueeze(1).unsqueeze(3), float("-inf")
+            )
+
+        attn = F.softmax(scores, dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        out_b = torch.einsum("bhnqk,bhnkd->bhnqd", attn, v_sel)         # (B, H, NB, BS, Dh)
+        out = out_b.reshape(B, H, N, Dh).transpose(1, 2).contiguous().view(B, N, -1)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
+# GroupedSparseAttention — window-grouped, dense within each window
+# ---------------------------------------------------------------------------
+
+class GroupedSparseAttention(nn.Module):
+    """Window-grouped self-attention along a 1-D (re-)serialized sequence.
+
+    After the encoder block gathers tokens into one of the 4 curve orderings,
+    we slice the sequence into non-overlapping windows of `group_size` G and
+    run dense self-attention WITHIN each window only. No cross-window mixing
+    this layer.
+
+    Compute: O(N · G · Dh) — much cheaper than BigBird's O(N · K_attended)
+    and ~G²-fold cheaper than dense O(N² · Dh).
+
+    Receptive field stays global through DEPTH because OmniBirdEncoder picks
+    a different serialization per layer, so a token's group neighbors at
+    layer ℓ are a different set than at layer ℓ+1. For G=16, ~log_16(N)
+    layers suffice for global mixing.
+    """
+
+    def __init__(self, dim, n_heads: int = 8, dim_head: int = 32,
+                 group_size: int = 16, bias_qkv: bool = False):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.group_size = group_size
+        self.to_qkv = nn.Linear(dim, inner * 3, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+
+    def forward(self, x, key_padding_mask=None):
+        """x: (B, N, D). N must be divisible by group_size (caller pads).
+        key_padding_mask: (B, N) bool, True at padded positions.
+        """
+        B, N, D = x.shape
+        G = self.group_size
+        assert N % G == 0, f"N={N} must be divisible by group_size={G}"
+        H, Dh = self.n_heads, self.dim_head
+        NG = N // G
+
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # (B, N, H*Dh) -> (B, NG, G, H, Dh) -> (B, NG, H, G, Dh)
+        q = q.view(B, NG, G, H, Dh).permute(0, 1, 3, 2, 4)
+        k = k.view(B, NG, G, H, Dh).permute(0, 1, 3, 2, 4)
+        v = v.view(B, NG, G, H, Dh).permute(0, 1, 3, 2, 4)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale         # (B, NG, H, G, G)
+        if key_padding_mask is not None:
+            kpm = key_padding_mask.view(B, NG, G).unsqueeze(2).unsqueeze(3)
+            scores = scores.masked_fill(kpm, float("-inf"))
+        attn = scores.softmax(dim=-1)
+        # Fully-padded groups produce all-masked rows → softmax → NaN.
+        # Zero them out; padded queries are unused downstream anyway.
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        out = attn @ v                                           # (B, NG, H, G, Dh)
+        out = out.permute(0, 1, 3, 2, 4).contiguous().view(B, N, H * Dh)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
+# CrossAttention — explicit Q from one source, K/V from another
+# ---------------------------------------------------------------------------
+
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention. Q ∈ ℝᴮˣᴺᑫˣᴰ, K=V ∈ ℝᴮˣᴺᴋˣᴰ.
+
+    Used by PerceiverPredictor where Q are the few group-level target queries
+    and K/V are the long context-encoder features.
+    """
+
+    def __init__(self, dim, n_heads: int = 8, dim_head: int = 32, bias_qkv: bool = False):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.to_q  = nn.Linear(dim, inner, bias=bias_qkv)
+        self.to_kv = nn.Linear(dim, inner * 2, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+
+    def forward(self, q_in, kv_in, key_padding_mask=None):
+        """q_in: (B, Nq, D), kv_in: (B, Nk, D), kpm: (B, Nk) bool, True=pad."""
+        B, Nq, _ = q_in.shape
+        Nk = kv_in.size(1)
+        H, Dh = self.n_heads, self.dim_head
+
+        q = self.to_q(q_in).view(B, Nq, H, Dh).transpose(1, 2)     # (B, H, Nq, Dh)
+        kv = self.to_kv(kv_in)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(B, Nk, H, Dh).transpose(1, 2)
+        v = v.view(B, Nk, H, Dh).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale            # (B, H, Nq, Nk)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask.view(B, 1, 1, Nk), float("-inf"))
+        attn = scores.softmax(dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, Nq, -1)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
+# LocalCrossAttention — cross-attention with spatial positional bias
+# ---------------------------------------------------------------------------
+
+class LocalCrossAttention(nn.Module):
+    """Cross-attention with explicit spatial-locality bias on attention scores.
+
+        scores[q, k] = (Q · K^T)/√D − α · ‖q_coords − k_coords‖²
+
+    Locality is **structural**, not learned: regardless of Q-K alignment, the
+    softmax peaks at keys whose coordinates are near the query's. Output is
+    therefore necessarily a function of *local* event content. This removes
+    the "constant output across centroids" failure mode of standard
+    CrossAttention when used as a pool over data-conditional position queries
+    — different queries have different local neighborhoods and so cannot
+    collapse to the same output unless the events themselves are uniform.
+
+    `bias_scale` controls how local. With coords in [-1, 1]^3:
+      - bias_scale=10 (default): ~10-nat preference for near (d²≈0) vs far
+        (d²≈1) events — strong but not nearest-neighbor only.
+      - higher → more local (peaked attention).
+      - lower → more global.
+    """
+
+    def __init__(self, dim, n_heads: int = 8, dim_head: int = 32,
+                 bias_qkv: bool = False, bias_scale: float = 10.0):
+        super().__init__()
+        inner = n_heads * dim_head
+        self.n_heads = n_heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.to_q  = nn.Linear(dim, inner, bias=bias_qkv)
+        self.to_kv = nn.Linear(dim, inner * 2, bias=bias_qkv)
+        self.to_out = nn.Linear(inner, dim)
+        self.bias_scale = bias_scale
+
+    def forward(self, q_in, kv_in, q_coords, k_coords, key_padding_mask=None):
+        """q_in: (B, Nq, D), kv_in: (B, Nk, D)
+        q_coords: (B, Nq, C), k_coords: (B, Nk, C) — used for locality bias.
+        kpm: (B, Nk) bool, True at padded key positions.
+        """
+        B, Nq, _ = q_in.shape
+        Nk = kv_in.size(1)
+        H, Dh = self.n_heads, self.dim_head
+
+        q = self.to_q(q_in).view(B, Nq, H, Dh).transpose(1, 2)        # (B, H, Nq, Dh)
+        kv = self.to_kv(kv_in)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(B, Nk, H, Dh).transpose(1, 2)
+        v = v.view(B, Nk, H, Dh).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) * self.scale               # (B, H, Nq, Nk)
+
+        # Spatial locality bias: −α · ‖q_coord − k_coord‖²
+        diff  = q_coords.unsqueeze(2) - k_coords.unsqueeze(1)         # (B, Nq, Nk, C)
+        dist2 = (diff * diff).sum(-1)                                  # (B, Nq, Nk)
+        scores = scores - self.bias_scale * dist2.unsqueeze(1)         # broadcast over H
+
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask.view(B, 1, 1, Nk), float("-inf"))
+        attn = scores.softmax(dim=-1)
+        if key_padding_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, Nq, -1)
+        return self.to_out(out)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: tied factory
+# ---------------------------------------------------------------------------
+
+def make_attention(kind: str, **kw):
+    if kind == "dense":
+        return MultiHeadAttention(
+            kw["dim"], n_heads=kw.get("n_heads", 8),
+            dim_head=kw.get("dim_head", 32),
+            bias_qkv=kw.get("bias_qkv", False),
+        )
+    elif kind == "bigbird":
+        return BigBirdSparseAttention(**kw)
+    elif kind == "grouped":
+        return GroupedSparseAttention(
+            kw["dim"], n_heads=kw.get("n_heads", 8),
+            dim_head=kw.get("dim_head", 32),
+            group_size=kw.get("group_size", 16),
+            bias_qkv=kw.get("bias_qkv", False),
+        )
+    raise ValueError(f"unknown attention kind: {kind}")
