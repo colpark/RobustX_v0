@@ -49,10 +49,17 @@ something like `Tunnel connection failed: 503 Service Unavailable`. Two
 ways around it:
 
 **Option A — manually place the zip and re-run.** From any machine with
-web access:
+web access (the Hugging Face mirror is the most reliable; the Stanford
+origin is sometimes flaky):
 
 ```bash
-wget https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip
+# Hugging Face mirror (preferred):
+wget -O modelnet40_ply_hdf5_2048.zip \
+  "https://huggingface.co/datasets/Msun/modelnet40/resolve/main/modelnet40_ply_hdf5_2048.zip?download=true"
+
+# Or the Stanford origin (may 503 from some clusters):
+# wget https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip
+
 # scp / rsync / move it to the cluster, then:
 mv modelnet40_ply_hdf5_2048.zip ~/data/modelnet40_ply_hdf5_2048.zip
 ```

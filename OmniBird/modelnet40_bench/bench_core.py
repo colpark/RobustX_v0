@@ -89,7 +89,13 @@ class ModelNet40Classifier(nn.Module):
 # ModelNet40 download + load (HDF5 from PointNet++ preprocessed release)
 # ===========================================================================
 
-MODELNET40_URL = "https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip"
+# Primary: Hugging Face mirror (more reliable from proxied clusters).
+# Fallback: original Stanford host.
+MODELNET40_URLS = [
+    "https://huggingface.co/datasets/Msun/modelnet40/resolve/main/modelnet40_ply_hdf5_2048.zip?download=true",
+    "https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip",
+]
+MODELNET40_URL = MODELNET40_URLS[0]   # back-compat alias
 MODELNET40_DIR_DEFAULT = os.environ.get(
     "MODELNET40_DIR",
     os.path.expanduser("~/data/modelnet40_ply_hdf5_2048"),
@@ -108,9 +114,10 @@ def _print_manual_instructions(zip_path: str, marker: str, last_err: Exception |
         "",
         "  MANUAL DOWNLOAD INSTRUCTIONS",
         "  ----------------------------",
-        "  1. From any machine with web access, download the zip:",
-        f"       wget {MODELNET40_URL}",
-        "     (or visit the URL in a browser; the file is ~400MB)",
+        "  1. From any machine with web access, download the zip (~400MB):",
+        f"       wget -O modelnet40_ply_hdf5_2048.zip \\",
+        f"         \"{MODELNET40_URLS[0]}\"",
+        "     (HF mirror; the Stanford origin tends to 503 from clusters)",
         "",
         "  2. Place the zip at:",
         f"       {zip_path}",
@@ -162,8 +169,8 @@ def download_modelnet40(target_dir: str = MODELNET40_DIR_DEFAULT,
             _print_manual_instructions(zip_path, marker)
             raise RuntimeError(f"extracted but {marker} is missing")
 
-    # Try downloading from each candidate URL
-    urls = urls or [MODELNET40_URL]
+    # Try downloading from each candidate URL (HF mirror first, Stanford fallback)
+    urls = urls or list(MODELNET40_URLS)
     last_err = None
     for url in urls:
         try:
