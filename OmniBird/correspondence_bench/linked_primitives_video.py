@@ -62,6 +62,7 @@ from linked_primitives import (
     Primitive, Scene as StaticScene,
     SHAPES, DEFAULT_PALETTE,
     _project, _rotation_x, _rotation_y,
+    FOCAL_DEFAULT,
 )
 
 
@@ -70,6 +71,11 @@ from linked_primitives import (
 # ===========================================================================
 
 OPERATING_POINTS = {
+    # ── Base difficulty ladder ──────────────────────────────────────────
+    # frequency_range is in CYCLES PER VIDEO (sinusoidal / circular only):
+    #   0.25–1.0   = slow      (less than a cycle to one cycle over T)
+    #   1.0–3.0    = medium
+    #   3.0–8.0    = fast       (multiple cycles)
     "easy": dict(
         n_linked=4, n_shapes=2, n_colors=3,
         view_disparity_deg=30.0,
@@ -77,9 +83,9 @@ OPERATING_POINTS = {
         scale_range=(0.10, 0.15),
         style="rgb", noise_sigma=0.0,
         adversarial_confusables=False,
-        # Temporal knobs:
         motion_type="static_or_slow_linear",
         motion_amplitude=0.0,
+        frequency_range=(0.25, 0.75),
         n_frames=8, fps=8,
         lifetime_jitter=0.0,
         cross_modal_time_offset=0.0,
@@ -93,6 +99,7 @@ OPERATING_POINTS = {
         adversarial_confusables=False,
         motion_type="linear_or_slow_sin",
         motion_amplitude=0.20,
+        frequency_range=(0.5, 1.5),
         n_frames=12, fps=8,
         lifetime_jitter=0.0,
         cross_modal_time_offset=0.0,
@@ -106,6 +113,7 @@ OPERATING_POINTS = {
         adversarial_confusables=False,
         motion_type="mixed",
         motion_amplitude=0.35,
+        frequency_range=(0.5, 3.0),
         n_frames=16, fps=8,
         lifetime_jitter=0.15,
         cross_modal_time_offset=0.01,
@@ -119,6 +127,7 @@ OPERATING_POINTS = {
         adversarial_confusables=False,
         motion_type="mixed",
         motion_amplitude=0.50,
+        frequency_range=(0.5, 5.0),
         n_frames=24, fps=12,
         lifetime_jitter=0.30,
         cross_modal_time_offset=0.02,
@@ -132,9 +141,70 @@ OPERATING_POINTS = {
         adversarial_confusables=True,
         motion_type="mixed",
         motion_amplitude=0.60,
+        frequency_range=(0.5, 5.0),
         n_frames=24, fps=12,
         lifetime_jitter=0.30,
         cross_modal_time_offset=0.03,
+    ),
+
+    # ── Hz-focused operating points (test slow vs fast vs simultaneous) ──
+    "slow_only": dict(
+        n_linked=16, n_shapes=4, n_colors=5,
+        view_disparity_deg=60.0,
+        n_distractors_A=2, n_distractors_B=2,
+        scale_range=(0.06, 0.16),
+        style="rgb", noise_sigma=0.02,
+        adversarial_confusables=False,
+        motion_type="sinusoidal",
+        motion_amplitude=0.30,
+        frequency_range=(0.25, 1.0),   # ALL primitives slow
+        n_frames=16, fps=8,
+        lifetime_jitter=0.0,
+        cross_modal_time_offset=0.0,
+    ),
+    "fast_only": dict(
+        n_linked=16, n_shapes=4, n_colors=5,
+        view_disparity_deg=60.0,
+        n_distractors_A=2, n_distractors_B=2,
+        scale_range=(0.06, 0.16),
+        style="rgb", noise_sigma=0.02,
+        adversarial_confusables=False,
+        motion_type="sinusoidal",
+        motion_amplitude=0.30,
+        frequency_range=(3.0, 8.0),    # ALL primitives fast
+        n_frames=24, fps=12,
+        lifetime_jitter=0.0,
+        cross_modal_time_offset=0.0,
+    ),
+    "mixed_hz": dict(
+        n_linked=24, n_shapes=4, n_colors=5,
+        view_disparity_deg=60.0,
+        n_distractors_A=2, n_distractors_B=2,
+        scale_range=(0.06, 0.16),
+        style="rgb", noise_sigma=0.02,
+        adversarial_confusables=False,
+        motion_type="sinusoidal",
+        motion_amplitude=0.30,
+        frequency_range=(0.25, 6.0),   # WIDE: each primitive samples
+                                        # independently → scene has both
+                                        # slow AND fast simultaneously
+        n_frames=24, fps=12,
+        lifetime_jitter=0.0,
+        cross_modal_time_offset=0.0,
+    ),
+    "multiscale_hz": dict(
+        n_linked=64, n_shapes=8, n_colors=8,
+        view_disparity_deg=120.0,
+        n_distractors_A=16, n_distractors_B=16,
+        scale_range=(0.03, 0.20),
+        style="grayscale_B", noise_sigma=0.05,
+        adversarial_confusables=False,
+        motion_type="mixed",
+        motion_amplitude=0.40,
+        frequency_range=(0.25, 8.0),   # very wide range, harder backbone
+        n_frames=24, fps=12,
+        lifetime_jitter=0.15,
+        cross_modal_time_offset=0.01,
     ),
 }
 
@@ -221,9 +291,16 @@ class STScene:
 def _sample_trajectory(rng: np.random.RandomState,
                        motion_type: str,
                        amplitude: float,
+                       freq_range: tuple,
                        pos_0: np.ndarray) -> Trajectory:
     """Pick a trajectory kind + parameters per the operating point's
-    `motion_type` policy."""
+    `motion_type` policy.
+
+    `freq_range = (f_min, f_max)` is in **cycles per video** (sinusoidal
+    and circular only). Each primitive samples its frequency
+    independently from this range, so a wide range produces a scene
+    containing both slow and fast primitives simultaneously.
+    """
     if motion_type == "static_or_slow_linear":
         kind = rng.choice(["static", "linear"], p=[0.7, 0.3])
     elif motion_type == "linear_or_slow_sin":
@@ -237,21 +314,28 @@ def _sample_trajectory(rng: np.random.RandomState,
         raise ValueError(motion_type)
 
     A = float(amplitude)
+    f_lo, f_hi = float(freq_range[0]), float(freq_range[1])
+
     if kind == "static":
-        return Trajectory("static", pos_0, {})
+        return Trajectory("static", pos_0, {"freq": 0.0})
     if kind == "linear":
         v = rng.uniform(-1, 1, 3).astype(np.float32) * A
-        return Trajectory("linear", pos_0, {"velocity": v})
+        return Trajectory("linear", pos_0, {"velocity": v, "freq": 0.0})
     if kind == "sinusoidal":
         amp = rng.uniform(-1, 1, 3).astype(np.float32) * A
-        freq = float(rng.uniform(0.5, 2.5))
+        # log-uniform sampling across the freq range gives a sensible
+        # multi-scale spread (slow and fast equally likely on log axis)
+        freq = float(math.exp(rng.uniform(math.log(f_lo), math.log(f_hi))))
         phase = rng.uniform(0, 2 * math.pi, 3).astype(np.float32)
         return Trajectory("sinusoidal", pos_0,
                           {"amp": amp, "freq": freq, "phase": phase})
     if kind == "circular":
         radius = float(rng.uniform(0.3, 1.0)) * A
-        omega = float(rng.uniform(-2 * math.pi, 2 * math.pi))
-        return Trajectory("circular", pos_0, {"radius": radius, "omega": omega})
+        freq = float(math.exp(rng.uniform(math.log(f_lo), math.log(f_hi))))
+        sign = float(rng.choice([-1.0, 1.0]))
+        omega = 2.0 * math.pi * freq * sign
+        return Trajectory("circular", pos_0,
+                          {"radius": radius, "omega": omega, "freq": freq})
     raise ValueError(kind)
 
 
@@ -292,10 +376,15 @@ class LinkedPrimitivesVideoGenerator:
             shape_id = int(rng.choice(shape_ids))
             color_idx = int(rng.choice(color_ids))
             color = self.palette[color_idx]
-            pos_0 = rng.uniform(-0.7, 0.7, size=3).astype(np.float32)
+            # Wider initial position so primitives reach near the image edges
+            # even after some motion. Motion can still push them off-screen
+            # at the highest amplitudes — that's fine, it's a difficulty knob.
+            pos_0 = rng.uniform(-1.0, 1.0, size=3).astype(np.float32)
             s_lo, s_hi = k["scale_range"]
             size = float(math.exp(rng.uniform(math.log(s_lo), math.log(s_hi))))
-            traj = _sample_trajectory(rng, k["motion_type"], k["motion_amplitude"], pos_0)
+            freq_range = k.get("frequency_range", (0.5, 1.5))
+            traj = _sample_trajectory(rng, k["motion_type"],
+                                       k["motion_amplitude"], freq_range, pos_0)
             # Lifetime model: `lifetime_jitter` is the PROBABILITY of being
             # transient. Persistent primitives live the full [0, 1] and are
             # available for tracking across the whole video; transient ones
@@ -322,7 +411,10 @@ class LinkedPrimitivesVideoGenerator:
             for j in range(n_extra):
                 src = linked[rng.randint(n_linked_before)]
                 pos0 = (src.trajectory.pos_0 + rng.uniform(-0.15, 0.15, 3)).astype(np.float32)
-                traj = _sample_trajectory(rng, k["motion_type"], k["motion_amplitude"], pos0)
+                traj = _sample_trajectory(
+                    rng, k["motion_type"], k["motion_amplitude"],
+                    k.get("frequency_range", (0.5, 1.5)), pos0,
+                )
                 linked.append(STPrimitive(
                     pid=n_linked_before + j,
                     shape_id=src.shape_id, color_idx=src.color_idx, color=src.color.copy(),
@@ -552,6 +644,24 @@ class LinkedPrimitivesVideoGenerator:
         if kind == "n_distinct_motion_kinds":
             kinds = {p.trajectory.kind for p in linked}
             return min(len(kinds), K - 1)
+        if kind == "has_fast_motion":
+            # 1 iff any primitive has frequency > 2.0 cycles/video
+            for p in linked:
+                if abs(p.trajectory.params.get("freq", 0.0)) > 2.0:
+                    return 1
+            return 0
+        if kind == "freq_band_count":
+            # Number of distinct frequency bands present in the scene.
+            # Useful for testing whether SSL detects multi-Hz simultaneously.
+            # Bands: {0}=static/linear, (0, 1]=slow, (1, 3]=medium, >3=fast.
+            bands = set()
+            for p in linked:
+                f = abs(p.trajectory.params.get("freq", 0.0))
+                if f == 0.0:    bands.add(0)
+                elif f <= 1.0:  bands.add(1)
+                elif f <= 3.0:  bands.add(2)
+                else:           bands.add(3)
+            return min(len(bands), K - 1)
         raise ValueError(kind)
 
 

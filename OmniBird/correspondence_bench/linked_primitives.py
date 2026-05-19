@@ -172,10 +172,15 @@ def _rotation_x(angle_rad: float) -> np.ndarray:
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
 
 
+FOCAL_DEFAULT = 2.0
+CAMERA_BACK_DEFAULT = 2.5
+
+
 def _project(pos_3d: np.ndarray, view: np.ndarray,
-             focal: float = 1.6, camera_back: float = 3.0):
+             focal: float = FOCAL_DEFAULT, camera_back: float = CAMERA_BACK_DEFAULT):
     """Pinhole projection. Returns ((sx, sy), z) where sx, sy ∈ [-1, 1]-ish
-    and z is the depth from the camera; or (None, None) if behind the camera."""
+    (sx = ±1 maps to image edge) and z is depth from the camera; or
+    (None, None) if behind the camera."""
     pt = view @ pos_3d
     z = pt[2] + camera_back
     if z <= 0.15:
@@ -223,8 +228,8 @@ class LinkedPrimitivesGenerator:
             shape_id = int(rng.choice(shape_ids_in_use))
             color_idx = int(rng.choice(color_ids_in_use))
             color = self.palette[color_idx]
-            # 3D position in the unit cube, but biased away from the camera axis
-            pos = rng.uniform(-0.9, 0.9, size=3).astype(np.float32)
+            # 3D position; wider range so projected primitives reach image edges
+            pos = rng.uniform(-1.1, 1.1, size=3).astype(np.float32)
             # log-uniform scale within the configured range
             s_lo, s_hi = k["scale_range"]
             size = float(math.exp(rng.uniform(math.log(s_lo), math.log(s_hi))))
@@ -329,8 +334,9 @@ class LinkedPrimitivesGenerator:
         projected.sort(key=lambda t: -t[0])
 
         for z, p, (sx, sy) in projected:
-            # World size → screen size: size * focal / z, then scale to pixels
-            r_px = max(2.0, p.size * 1.6 / z * (W / 2))
+            # World size → screen size: size * focal / z, then scale to pixels.
+            # focal here MUST match the projection focal in _project (FOCAL_DEFAULT)
+            r_px = max(2.0, p.size * FOCAL_DEFAULT / z * (W / 2))
             cx = W * 0.5 + sx * (W / 2)
             cy = H * 0.5 - sy * (H / 2)
             color = tuple(int(c * 255) for c in p.color)

@@ -213,13 +213,15 @@ generator.save_gif(video["view_B"]["rgb"], "view_B.gif", fps=scene.fps)
 
 ### Built-in labels (`compute_label`)
 
-In addition to the three static labels from Dataset A, two new
+In addition to the three static labels from Dataset A, four new
 spatiotemporal labels:
 
 | `kind` | What it computes |
 |---|---|
 | `has_motion_pattern` | 1 iff at least one primitive has a `circular` or `sinusoidal` trajectory |
 | `n_distinct_motion_kinds` | count of distinct trajectory kinds (`static`/`linear`/`sin`/`circular`) |
+| `has_fast_motion` | 1 iff any primitive has frequency > 2.0 cycles per video — tests whether the model detects high-frequency dynamics anywhere in the scene |
+| `freq_band_count` | count of distinct frequency bands {static, slow, medium, fast} present in the scene — explicit test of multi-Hz simultaneous detection |
 
 ### Downstream tasks (use Dataset B for these)
 
@@ -265,10 +267,23 @@ Inherits the spatial knobs above, plus:
 |---|---|---|---|---|---|
 | motion type policy | static_or_slow_linear | linear_or_slow_sin | mixed | mixed | mixed |
 | motion amplitude | 0.0 | 0.20 | 0.35 | 0.50 | 0.60 |
+| frequency range (cycles/video) | (0.25, 0.75) | (0.5, 1.5) | (0.5, 3.0) | (0.5, 5.0) | (0.5, 5.0) |
 | n_frames | 8 | 12 | 16 | 24 | 24 |
 | fps | 8 | 8 | 8 | 12 | 12 |
 | lifetime jitter | 0.0 | 0.0 | 0.15 | 0.30 | 0.30 |
 | cross-modal time offset | 0.0 | 0.0 | 0.01 | 0.02 | 0.03 |
+
+### Hz-focused operating points (Dataset B only)
+
+Per-primitive frequency is sampled log-uniformly from `frequency_range`,
+so a wide range puts both slow and fast primitives in the **same scene**.
+
+| Operating point | frequency range | What it tests |
+|---|---|---|
+| `slow_only` | (0.25, 1.0) | Detection of slow dynamics in isolation |
+| `fast_only` | (3.0, 8.0) | Detection of fast dynamics in isolation |
+| `mixed_hz` | (0.25, 6.0) | **Multi-Hz simultaneously** — each scene has slow + fast primitives co-existing |
+| `multiscale_hz` | (0.25, 8.0) on `hard` spatial backbone | Multi-Hz × multi-shape × style gap |
 
 For one-knob ablations, pass a `dict` instead of a name:
 ```python
