@@ -379,11 +379,42 @@ behaviour and parameter ranges; see `augmenters.py`.
 
 **File:** `multiview_primitives.py`
 
-A third dataset designed for **multi-view scene-understanding** SSL.
-N (=3 by default) cameras with **narrow FOV** (focal=4.0, vs 2.0 in A/B)
-tile the scene at angles +13° / 0° / −13°. Each camera sees roughly
-half of what a single wide-FOV camera would see; their union covers
+A third dataset designed for **multi-view sensor-fusion / scene-
+understanding** SSL. N (=3 by default) cameras tile the scene at angles
++13° / 0° / −13° with narrow FOV. Each camera sees roughly half of
+what a single wide-FOV camera would see; their union covers
 approximately the same angular extent.
+
+By default, the three cameras are **three different sensor modalities**,
+mimicking a real fusion stack:
+
+| Camera | Angle | Modality | Focal | Visual signature |
+|---|---|---|---|---|
+| 0 | +13° | **LiDAR** (`LiDARModality`) | 3.0 | sparse plasma-colored returns on dark background |
+| 1 |  0°  | **Infrared** (`InfraredModality`) | 4.0 | dense inferno-colored temperature heatmap |
+| 2 | -13° | **Depth-Camera** (`DepthCameraModality`) | 3.5 | dense viridis-colored depth (close=bright) |
+
+Modalities live in `modalities.py` and are independent from the
+augmenter API in `augmenters.py`. Modalities define **what the sensor
+returns**; augmenters define **noise applied on top**. The two compose
+freely.
+
+Sensor characteristics:
+
+- **LiDAR** is *sparse* — only ~15% of foreground pixels become "returns";
+  the rest is dark. `seg` is set to -1 outside the sparse returns
+  (the model has no observation there).
+- **Infrared** is *dense but identity-ambiguous* — pixels are colormapped
+  temperatures derived deterministically from `(shape_id, color_idx)`.
+  Different primitives can land at the same temperature, so IR alone
+  cannot always distinguish them.
+- **Depth** is *dense and geometrically informative* — every foreground
+  pixel carries a depth value, with no color/material distinction.
+
+Together they're complementary; sensor fusion is the way to recover
+the latent scene reliably. Override the default via the operating-point
+knob `view_modalities = ("rgb", "depth", "infrared")` (or any
+3-tuple), with optional per-view focals via `view_focals`.
 
 ### Generative process — visibility guarantee
 

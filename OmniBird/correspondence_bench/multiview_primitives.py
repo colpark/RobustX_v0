@@ -85,6 +85,7 @@ from linked_primitives import (
     _project, _rotation_x, _rotation_y,
     FOCAL_DEFAULT, CAMERA_BACK_DEFAULT,
 )
+from modalities import make_modality, MODALITY_REGISTRY
 
 
 # ===========================================================================
@@ -94,12 +95,28 @@ from linked_primitives import (
 DEFAULT_VIEW_ANGLES_DEG = (+13.0, 0.0, -13.0)
 DEFAULT_FOCAL_NARROW = 4.0
 
+# Sensor-fusion default: three modalities loosely modelled on LiDAR /
+# infrared / depth-camera. Order corresponds to view_angles_deg.
+DEFAULT_VIEW_MODALITIES = ("lidar", "infrared", "depth")
+
+# Per-modality default focal lengths (mimic real sensor characteristics):
+#   LiDAR — typically wide horizontal FOV (here: wider focal=3.0)
+#   IR    — telephoto / narrow (focal=4.0)
+#   Depth — Kinect/RealSense-like medium (focal=3.5)
+DEFAULT_FOCAL_BY_MODALITY = {
+    "lidar":    3.0,
+    "infrared": 4.0,
+    "depth":    3.5,
+    "rgb":      4.0,    # standard narrow-FOV RGB (back-compat)
+}
+
 OPERATING_POINTS = {
     "easy": dict(
         n_linked=8, n_shapes=2, n_colors=3,
         n_distractors_total=0,
         scale_range=(0.10, 0.20),
         view_angles_deg=DEFAULT_VIEW_ANGLES_DEG,
+        view_modalities=DEFAULT_VIEW_MODALITIES,
         focal_narrow=DEFAULT_FOCAL_NARROW,
         require_visibility=True,
         adversarial_confusables=False,
@@ -109,6 +126,7 @@ OPERATING_POINTS = {
         n_distractors_total=4,
         scale_range=(0.06, 0.20),
         view_angles_deg=DEFAULT_VIEW_ANGLES_DEG,
+        view_modalities=DEFAULT_VIEW_MODALITIES,
         focal_narrow=DEFAULT_FOCAL_NARROW,
         require_visibility=True,
         adversarial_confusables=False,
@@ -118,6 +136,7 @@ OPERATING_POINTS = {
         n_distractors_total=20,
         scale_range=(0.03, 0.20),
         view_angles_deg=DEFAULT_VIEW_ANGLES_DEG,
+        view_modalities=DEFAULT_VIEW_MODALITIES,
         focal_narrow=DEFAULT_FOCAL_NARROW,
         require_visibility=True,
         adversarial_confusables=False,
@@ -130,6 +149,7 @@ OPERATING_POINTS = {
         n_distractors_total=48,
         scale_range=(0.03, 0.25),
         view_angles_deg=DEFAULT_VIEW_ANGLES_DEG,
+        view_modalities=DEFAULT_VIEW_MODALITIES,
         focal_narrow=DEFAULT_FOCAL_NARROW,
         require_visibility=True,
         adversarial_confusables=False,
@@ -139,6 +159,7 @@ OPERATING_POINTS = {
         n_distractors_total=64,
         scale_range=(0.03, 0.25),
         view_angles_deg=DEFAULT_VIEW_ANGLES_DEG,
+        view_modalities=DEFAULT_VIEW_MODALITIES,
         focal_narrow=DEFAULT_FOCAL_NARROW,
         require_visibility=True,
         adversarial_confusables=True,
@@ -152,25 +173,36 @@ OPERATING_POINTS = {
 
 @dataclass
 class MVScene:
-    """Scene with N camera matrices and per-camera focal length.
+    """Scene with N cameras, per-camera focal length, per-camera modality.
 
     `linked` is the FILTERED set of primitives — those visible in at
     least one camera (if require_visibility=True at sampling time).
     `unobservable` holds primitives that were sampled but invisible
     everywhere — they are returned for diagnostic purposes only and
     do NOT contribute to labels or correspondences.
+
+    `view_focals[i]` is the focal length of camera `i`, and
+    `view_modalities[i]` is the sensor type (one of "rgb", "depth",
+    "lidar", "infrared"). The default 3-camera sensor-fusion config has
+    LiDAR / IR / depth modalities with sensor-realistic per-camera focals.
     """
     linked: list[Primitive]
     unobservable: list[Primitive]
     distractors_per_view: list[list[Primitive]]   # length N
     view_matrices: list[np.ndarray]                # length N, each (3, 3)
-    focal_narrow: float
+    view_focals: list[float]                       # length N
+    view_modalities: list[str]                     # length N
     knobs: dict = field(default_factory=dict)
     seed: int = 0
 
     @property
     def n_views(self) -> int:
         return len(self.view_matrices)
+
+    @property
+    def focal_narrow(self) -> float:
+        # Legacy accessor — returns the first camera's focal (back-compat).
+        return self.view_focals[0] if self.view_focals else DEFAULT_FOCAL_NARROW
 
 
 # ===========================================================================
@@ -254,9 +286,20 @@ class MultiViewLinkedPrimitivesGenerator:
                 p.size = src.size * float(rng.uniform(0.7, 1.3))
                 candidates.append(p)
 
-        # Camera setup
+        # Camera setup — per-view rotation, focal length, and modality.
         view_angles_deg = k["view_angles_deg"]
-        focal_narrow = float(k["focal_narrow"])
+        view_modalities = list(k.get("view_modalities", DEFAULT_VIEW_MODALITIES))
+        # Resolve per-view focal: explicit `view_focals` overrides; else look up
+        # the modality's default; else fall back to `focal_narrow`.
+        view_focals_override = k.get("view_focals", None)
+        fallback_focal = float(k.get("focal_narrow", DEFAULT_FOCAL_NARROW))
+        view_focals = []
+        for i, modality in enumerate(view_modalities):
+            if view_focals_override is not None:
+                view_focals.append(float(view_focals_override[i]))
+            else:
+                view_focals.append(float(DEFAULT_FOCAL_BY_MODALITY.get(modality, fallback_focal)))
+
         view_matrices = []
         tilt = math.radians(float(rng.uniform(-10, 10)))   # shared small x-tilt
         for ang_deg in view_angles_deg:
@@ -264,15 +307,13 @@ class MultiViewLinkedPrimitivesGenerator:
             view_matrices.append(_rotation_x(tilt) @ _rotation_y(ang_rad))
 
         # Visibility check: drop primitives that no camera sees.
-        # _project returns None if behind the camera, but on-screen visibility
-        # also requires |sx|, |sy| ≤ 1 (after the focal). We do that check
-        # explicitly here using the narrow focal.
+        # Each camera has its own focal so we check per-camera.
         H = W = self.image_size
 
         def is_visible_in_any_view(p: Primitive) -> bool:
-            for V in view_matrices:
+            for V, f in zip(view_matrices, view_focals):
                 screen, z = _project(p.pos_3d, V,
-                                      focal=focal_narrow, camera_back=CAMERA_BACK_DEFAULT)
+                                      focal=f, camera_back=CAMERA_BACK_DEFAULT)
                 if screen is None: continue
                 sx, sy = screen
                 if -1.0 <= sx <= 1.0 and -1.0 <= sy <= 1.0:
@@ -315,7 +356,8 @@ class MultiViewLinkedPrimitivesGenerator:
             unobservable=unobservable,
             distractors_per_view=distractors_per_view,
             view_matrices=view_matrices,
-            focal_narrow=focal_narrow,
+            view_focals=view_focals,
+            view_modalities=view_modalities,
             knobs=dict(self.knobs),
             seed=int(seed if seed is not None else self.base_seed),
         )
@@ -323,24 +365,48 @@ class MultiViewLinkedPrimitivesGenerator:
     # ---- rendering ----
 
     def render(self, scene: MVScene) -> list[dict]:
-        """Render every camera. Returns a list of N render-output dicts.
+        """Render every camera with its modality.
 
-        Each dict has the same schema as LinkedPrimitivesGenerator.render:
-            rgb  : (H, W, 3) uint8
-            seg  : (H, W)    int32; -1 background
-            kpts : (N_in_view, 2) float32
-            vis  : (N_in_view,)   bool
-            ids  : (N_in_view,)   int32 — primitive IDs in canonical order
+        Returns a list of N render-output dicts, one per camera. Each
+        dict has the schema:
 
-        Canonical order in each view = linked primitives (n_link of them)
-        followed by that view's distractors. So `ids[:n_link]` is the
-        same across all views (they share the same linked set), and the
-        per-view distractor IDs start at index n_link.
+            rgb              : (H, W, 3) uint8 — sensor-style image
+                               (modality-specific look: LiDAR sparse
+                               points, IR heatmap, depth colormap, ...)
+            seg              : (H, W) int32 — primitive ID per pixel
+                               (LiDAR sets this to -1 outside its
+                               sparse returns)
+            depth            : (H, W) float32 — z-distance per pixel,
+                               NaN at background
+            kpts             : (N_in_view, 2) float32 — projected centers
+            vis              : (N_in_view,) bool
+            ids              : (N_in_view,) int32 — primitive IDs
+            modality         : str — name of the modality
+            focal            : float — focal length used
+
+        Canonical order in each view: linked primitives first (n_link of
+        them), then that view's distractors. `ids[:n_link]` is the same
+        across all views (the linked set is shared).
         """
         outs = []
-        for v_idx, view_mat in enumerate(scene.view_matrices):
+        n_views = scene.n_views
+        for v_idx, (view_mat, focal, mod_name) in enumerate(zip(
+                scene.view_matrices, scene.view_focals, scene.view_modalities)):
             primitives = scene.linked + scene.distractors_per_view[v_idx]
-            outs.append(self._render_one(primitives, view_mat, scene.focal_narrow))
+            base = self._render_one(primitives, view_mat, focal)
+            base["modality"] = mod_name
+            base["focal"]    = focal
+            # primitives_meta needed by Infrared modality
+            base["primitives_meta"] = {
+                p.pid: (p.shape_id, p.color_idx) for p in primitives
+            }
+            # Apply the modality transform (mutates rgb, possibly seg)
+            modality = make_modality(mod_name)
+            view_rng = np.random.RandomState(scene.seed * 100 + v_idx)
+            transformed = modality(base, rng=view_rng)
+            # Drop primitives_meta from the public output — modality used it
+            transformed.pop("primitives_meta", None)
+            outs.append(transformed)
         return outs
 
     def _render_one(self, primitives, view_mat, focal_narrow):
@@ -369,6 +435,16 @@ class MultiViewLinkedPrimitivesGenerator:
         seg_arr = np.array(seg_img, dtype=np.int32)
         rgb_arr = np.array(rgb_img, dtype=np.uint8)
 
+        # Per-pixel depth: for each visible primitive, paint its z into a
+        # depth array at the pixels it owns in seg. Background = NaN.
+        # (The seg painting was depth-sorted front-over-back, so seg already
+        # encodes "which primitive is the frontmost at each pixel" — we use
+        # that to read off depth without any redundant draw pass.)
+        depth_arr = np.full(seg_arr.shape, np.nan, dtype=np.float32)
+        pid_to_z = {int(p.pid): float(z) for z, p, _ in projected}
+        for pid, z_val in pid_to_z.items():
+            depth_arr[seg_arr == pid] = z_val
+
         ids = np.array([p.pid for p in primitives], dtype=np.int32)
         kpts = np.full((len(primitives), 2), np.nan, dtype=np.float32)
         vis = np.zeros(len(primitives), dtype=bool)
@@ -381,7 +457,8 @@ class MultiViewLinkedPrimitivesGenerator:
             if 0 <= cx < W and 0 <= cy < H:
                 kpts[i] = (cx, cy)
                 vis[i] = bool((seg_arr == p.pid).any())
-        return dict(rgb=rgb_arr, seg=seg_arr, kpts=kpts, vis=vis, ids=ids)
+        return dict(rgb=rgb_arr, seg=seg_arr, depth=depth_arr,
+                    kpts=kpts, vis=vis, ids=ids)
 
     def _draw_shape(self, draw_rgb, draw_seg, shape_id, cx, cy, r, color, pid):
         # Same dispatch as linked_primitives.py — extracted as a method to

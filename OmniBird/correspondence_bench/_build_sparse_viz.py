@@ -25,6 +25,7 @@ a separate augmenter or a separate generator.
 | **1. Random subsample** | `RandomSubsampleAugmenter` | Sparse-sampling modalities (point clouds, event cameras, sparse pixel pools) |
 | **2. Center occlusion** | `CenterOcclusionAugmenter` | A foreground object blocking part of the camera, or intentional center masking for inpainting-style SSL |
 | **3. Multi-view limited FOV** | `MultiViewLinkedPrimitivesGenerator` (3 cameras, narrow FOV each) | Multi-sensor scene-understanding where each sensor sees only part of the scene |
+| **3b. Multi-modal sensor fusion** | Same as 3, but each camera is a different sensor: LiDAR, Infrared, Depth-Camera (modalities in `modalities.py`) | Realistic multi-sensor fusion: each modality has its own visual signature and information loss |
 
 ## Design principle: noise/sparsity is SEPARATE from difficulty
 
@@ -224,6 +225,122 @@ code(r"""for name in ["basic", "hard", "extreme"]:
     print(f"    visible in each view : {cov['visible_in_each']}")
     print(f"    visible in at least 1: {cov['visible_in_any']} / {len(scene.linked)}  (= {100*cov['coverage_frac']:.1f}%)")
     print(f"    visible in all 3     : {cov['visible_in_all']}")
+""")
+
+
+# =============================================================================
+md(r"""## §6b. Three sensor modalities — LiDAR / Infrared / Depth-Camera
+
+By default, the three views of the multi-view variant are **three
+different sensor modalities**, mimicking a sensor-fusion stack:
+
+| Camera | Angle | Modality | Focal | Visual signature |
+|---|---|---|---|---|
+| 0 | +13° | **LiDAR** | 3.0 (wide) | sparse plasma-colored returns on dark background |
+| 1 |  0°  | **Infrared** | 4.0 (narrow) | dense inferno-colored temperature heatmap |
+| 2 | -13° | **Depth-Camera** | 3.5 (medium) | dense viridis-colored depth (close=bright) |
+
+The modalities are intentionally **visually distinct**:
+
+* **LiDAR** is **sparse** — only ~15% of foreground pixels become returns;
+  the rest of the image is dark. The model must reason about identity
+  from a few colored points.
+* **Infrared** is **dense but identity-ambiguous** — pixels are
+  colormapped temperatures derived from each primitive's
+  `(shape_id, color_idx)`. Different primitives can land at the same
+  temperature (the lookup is many-to-one), so IR alone can't always
+  distinguish them.
+* **Depth** is **dense and geometrically informative** but contains no
+  color/material information — every primitive is just its depth.
+
+Together they're complementary: depth + IR + LiDAR carries more
+information than any single modality alone. This is the sensor-fusion
+property that the multi-modal SSL task must learn to exploit.
+""")
+code(r"""for name in ["basic", "hard"]:
+    gen = MultiViewLinkedPrimitivesGenerator(operating_point=name, image_size=128, base_seed=21)
+    scene = gen.sample_scene(seed=21)
+    renders = gen.render(scene)
+    fig, axes = plt.subplots(1, len(renders), figsize=(5 * len(renders), 5))
+    for col, r in enumerate(renders):
+        axes[col].imshow(r["rgb"]); axes[col].axis("off")
+        axes[col].set_title(
+            f"cam {col}   modality = {r['modality'].upper()}\n"
+            f"angle = {scene.knobs['view_angles_deg'][col]:+.0f}°   focal = {r['focal']:.1f}\n"
+            f"visible primitives = {int(r['vis'].sum())}",
+            fontsize=10,
+        )
+    plt.suptitle(f"Three modalities at operating point '{name}'", y=1.03)
+    plt.tight_layout(); plt.show()
+""")
+
+
+md(r"""### Per-pixel depth + IR temperature lookup (diagnostic)
+
+The renderer also emits a per-pixel `depth` field (z-distance from
+camera). The IR modality uses a deterministic `(shape_id, color_idx) →
+temperature` lookup, so the same primitive emits the same temperature
+in every IR-rendered scene. Below: depth map (raw float), temperature
+lookup table for current shape/color, and the rendered IR image.
+""")
+code(r"""from modalities import InfraredModality
+gen = MultiViewLinkedPrimitivesGenerator(operating_point="basic", image_size=128, base_seed=21)
+scene = gen.sample_scene(seed=21)
+renders = gen.render(scene)
+ir_render = renders[1]   # camera 1 = infrared by default
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+# Depth map (with background masked white for clarity)
+depth = ir_render["depth"]
+disp_depth = depth.copy()
+disp_depth[~np.isfinite(disp_depth)] = np.nan
+im0 = axes[0].imshow(disp_depth, cmap="viridis_r")
+axes[0].set_title("camera 1 — raw per-pixel depth (foreground only)"); axes[0].axis("off")
+plt.colorbar(im0, ax=axes[0], fraction=0.046)
+
+# Temperature lookup table
+shapes = list(range(10)); colors_ = list(range(10))
+tbl = np.array([[InfraredModality.temperature_for(s, c) for c in colors_] for s in shapes])
+im1 = axes[1].imshow(tbl, cmap="inferno", vmin=0, vmax=1, aspect="auto")
+axes[1].set_xticks(colors_); axes[1].set_yticks(shapes)
+axes[1].set_xlabel("color_idx"); axes[1].set_ylabel("shape_id")
+axes[1].set_title("(shape_id, color_idx) → temperature lookup")
+plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+axes[2].imshow(ir_render["rgb"]); axes[2].axis("off")
+axes[2].set_title("camera 1 — rendered IR image (after blur)")
+plt.tight_layout(); plt.show()
+""")
+
+
+md(r"""### LiDAR sparse-return diagnostic
+
+The LiDAR modality keeps only `keep_fraction = 0.15` of foreground
+pixels by default; the rest is dark. Crucially, **the `seg` map is
+also -1 outside the sparse returns** — i.e. the model has no
+ground-truth label there either. Plot the kept return locations as
+white dots on top of the dark LiDAR image to make the sparsity
+obvious.
+""")
+code(r"""gen = MultiViewLinkedPrimitivesGenerator(operating_point="basic", image_size=128, base_seed=21)
+scene = gen.sample_scene(seed=21)
+renders = gen.render(scene)
+lidar_render = renders[0]
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+axes[0].imshow(lidar_render["rgb"])
+axes[0].set_title(f"camera 0 — LiDAR image  ({(lidar_render['seg'] >= 0).sum()} returns)")
+axes[0].axis("off")
+
+# Return-density overlay: mark each return pixel as a white dot on the
+# (otherwise-dark) image.
+overlay = lidar_render["rgb"].copy()
+ys, xs = np.where(lidar_render["seg"] >= 0)
+axes[1].imshow(overlay)
+axes[1].scatter(xs, ys, c='white', s=0.6, alpha=0.7)
+axes[1].set_title("LiDAR returns highlighted (white dots)")
+axes[1].axis("off")
+plt.tight_layout(); plt.show()
 """)
 
 

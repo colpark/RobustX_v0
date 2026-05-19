@@ -234,12 +234,16 @@ def generate(dataset: str,
             label = gen.compute_label(scene, kind=default_label, K=label_K)
             payload = {}
             for v_idx, r in enumerate(renders_aug):
-                payload[f"rgb_{v_idx}"] = r["rgb"]
-                payload[f"seg_{v_idx}"] = r["seg"]
-                payload[f"kpts_{v_idx}"] = r["kpts"]
-                payload[f"vis_{v_idx}"] = r["vis"]
-                payload[f"ids_{v_idx}"] = r["ids"]
+                payload[f"rgb_{v_idx}"]      = r["rgb"]
+                payload[f"seg_{v_idx}"]      = r["seg"]
+                payload[f"depth_{v_idx}"]    = r["depth"]
+                payload[f"kpts_{v_idx}"]     = r["kpts"]
+                payload[f"vis_{v_idx}"]      = r["vis"]
+                payload[f"ids_{v_idx}"]      = r["ids"]
+                payload[f"modality_{v_idx}"] = np.array(r.get("modality", ""))
+                payload[f"focal_{v_idx}"]    = float(r.get("focal", 0.0))
             payload["view_angles_deg"] = np.asarray(scene.knobs["view_angles_deg"], dtype=np.float32)
+            payload["view_modalities"]  = np.asarray(scene.view_modalities)
             cov = coverage_summary(renders, n_linked=len(scene.linked))
             coverage_accum.append(cov)
 
