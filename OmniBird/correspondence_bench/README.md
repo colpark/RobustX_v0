@@ -3,59 +3,52 @@
 A synthetic benchmark designed to **measure whether a self-supervised
 learning recipe can discover fine-grained cross-modal correspondences**
 — and whether better correspondence learning translates into better
-downstream classification / segmentation.
+downstream classification, segmentation, and tracking.
 
-The benchmark is composed of two complementary datasets:
+The benchmark ships two dataset versions that share the same generative
+core but differ in whether the scene has motion:
 
-| | Dataset | Modalities | Best for |
+| | Dataset | What you get | Best for |
 |---|---|---|---|
-| **A** | **Linked Primitives** | Two rendered 2D images (different camera views) of the same 3D primitive scene | Visual debugging; classification + segmentation; the human-interpretable "main figure" of a paper |
-| **C** | **Synthetic Event Streams** | Two sparse point sets in space-time, with modality-specific attributes | Sparse-input SSL recipes (events, point clouds); matches the FPS+KNN pipeline directly |
+| **A** | **Linked Primitives (static)** | One pair of RGB images: two camera views of a 3D primitive scene at one instant | Classification, segmentation, cross-view dense correspondence — the canonical static-multimodal task |
+| **B** | **Linked Primitives Video (spatiotemporal)** | One pair of short videos: two camera views of the same primitive scene over time, plus a GIF | Video classification, spatiotemporal segmentation, tracking, motion-conditioned correspondence, optical flow |
 
-Both datasets share the same **design philosophy** and the same **named
-difficulty operating points** (`easy / basic / hard / extreme /
-adversarial`). The intent is that the **same SSL method** can be
-evaluated on both datasets at the same operating point and the results
-are directly comparable.
+Both share the same difficulty operating points (`easy / basic / hard /
+extreme / adversarial`) and the same per-primitive ID space, so an SSL
+method can be evaluated on both with comparable settings.
 
 ---
 
 ## 1. Why this benchmark exists
 
-Existing multimodal SSL benchmarks are not designed to **isolate
-correspondence learning**. They tend to fail one of the following:
+The standard multimodal SSL evaluation toolkit has gaps:
 
-1. **Global statistics suffice.** Many image-pair datasets can be solved
-   by learning a global representation (e.g. average colour, total
-   brightness). The model never has to do fine-grained correspondence,
-   so we can't tell whether it has the ability.
-2. **No ground-truth correspondences.** Real datasets don't ship with
-   pixel-level cross-modal alignment, so we evaluate via downstream
-   proxy tasks and can't probe the correspondence quality directly.
-3. **Difficulty is not parameterized.** Real datasets are "hard" or
-   "easy" as a whole; you can't dial them up to test where a method
-   breaks.
-4. **Multi-scale structure is not controlled.** Real data has whatever
-   scale distribution it has. We can't test scale-equivariance with
-   experiments where scale is the only thing that varies.
+1. **Global statistics suffice** on many image-pair datasets — you can
+   reach high accuracy without doing any fine correspondence.
+2. **No ground-truth correspondences** in real datasets, so we evaluate
+   via downstream proxies instead of probing the SSL representation
+   directly.
+3. **Difficulty isn't parameterized** — you can't dial it up to test
+   where a method breaks.
+4. **Multi-scale + multi-temporal structure isn't controlled** —
+   primitives can't be made to span 10× in spatial scale or 10× in
+   temporal scale on demand.
 
 This benchmark fixes all four:
 
 1. **Label depends on the latent scene, not the observations.** The
-   class label is computed from the *primitive-set latents*, not from
-   the rendered image. So you can't solve it by global statistics —
-   you have to recover (a sufficient statistic of) the latents, which
-   requires cross-modal correspondence.
+   class label is computed from primitive-set latents, not from rendered
+   pixels. You can't solve it by global statistics — you must recover a
+   sufficient statistic of the latents, which requires correspondence.
 2. **Ground-truth correspondences are returned with every sample.**
-   Each primitive carries a stable integer ID present in both modality
-   renders, and we ship a helper that returns the `(M, 2)` matched
-   pair list directly.
+   Every primitive has a stable integer ID present in every view and
+   every frame. We ship helpers that return matched-pair lists at all
+   three granularities (§ 3).
 3. **A vector of independent difficulty knobs.** Five named operating
-   points span EASY → ADVERSARIAL, plus you can pin everything except
-   one knob to do single-axis ablations.
-4. **Scale variance is an explicit knob.** `scale_range = (0.02, 0.25)`
-   means primitives' physical sizes span > 12× in the same scene,
-   forcing the model to be scale-aware.
+   points span EASY → ADVERSARIAL; you can pin everything except one
+   knob for single-axis ablations.
+4. **Scale and motion are explicit knobs.** Spatial `scale_range` and
+   temporal `motion_amplitude` are independently dialed.
 
 ---
 
@@ -64,243 +57,288 @@ This benchmark fixes all four:
 Both datasets follow the same schema:
 
 ```
-Latent scene  z = {entity_1, entity_2, ..., entity_N}
+Latent scene  z = {entity_1, ..., entity_N}, each with possibly a trajectory
                                                       ↓
-Modality A observation  X_A = g_A(z)              Modality B observation  X_B = g_B(z)
+Modality A render  X_A = g_A(z)               Modality B render  X_B = g_B(z)
                                                       ↓
                        Label  y = φ(z)
-                       Correspondences  C = {(i_A, i_B) : both modalities see entity_i}
+                       Correspondences  C = {(i_X, j_Y) : matches}
 ```
 
 Crucially:
-- `g_A` and `g_B` are **deterministic** given `z` (and a random
-  per-modality nuisance: jitter, noise, style).
-- `y = φ(z)` is computable **only from the latents**. A model that
-  predicts `y` must recover a sufficient statistic of `z`, which
-  forces it to solve the cross-modal alignment problem.
-- The correspondence ground truth `C` is **returned with every
-  sample**, so you can evaluate it directly (not just via downstream
-  proxies).
+- `g_A` and `g_B` are **deterministic** given `z` (and per-modality
+  nuisance: jitter, noise, style transform).
+- `y = φ(z)` is computable **only from the latents**. To predict `y`, a
+  model must recover (a sufficient statistic of) `z`, which forces it
+  to solve the cross-modal alignment.
+- The correspondence ground truth `C` is **returned with every sample**.
 
 ---
 
-## 3. Dataset A — Linked Primitives
+## 3. The three kinds of correspondence (B only — A has just the first)
+
+Because every primitive carries a stable `pid` everywhere it's visible:
+
+1. **Cross-view at same time**  (pid, view=A, τ) ↔ (pid, view=B, τ)
+   — same primitive seen from two cameras. The *only* kind in dataset A.
+   - Helper: `cross_view_pairs_at_time(video, t_idx)` for dataset B;
+     `correspondence_pairs(rA, rB)` for dataset A.
+
+2. **Cross-time within a view**  (pid, view=A, τ₁) ↔ (pid, view=A, τ₂)
+   — same primitive at two different times in the same camera. The
+   ground truth for **tracking** and **optical flow** within one
+   modality.
+   - Helper: `cross_time_pairs_within_view(video, view, t1, t2)`.
+   - Bonus: `trajectories_for_view(video, view)` returns the full (T, 2)
+     keypoint path for every pid in one view.
+
+3. **Cross-view AND cross-time**  (pid, view=A, τ₁) ↔ (pid, view=B, τ₂)
+   — the union; same pid wherever it appears. The most flexible ground
+   truth, and the one a fully general spatiotemporal-multimodal SSL
+   recipe should be able to recover.
+   - Use the same `pid` membership across both views' `ids` arrays;
+     intersect by pid as needed.
+
+---
+
+## 4. Dataset A — Linked Primitives (static)
+
+**File:** `linked_primitives.py`
 
 ### Generative process
 
-A scene contains **N "linked" primitives** placed in 3D space:
+Each scene contains N "linked" primitives placed in 3D space:
 
 | Attribute | Range / domain |
 |---|---|
 | `shape_id` | one of `circle, square, triangle, plus, star, diamond, hexagon, cross, pentagon, octagon` |
 | `color_idx` | one of K configurable RGB palette entries |
-| `pos_3d` | uniform in [-0.9, 0.9]^3 |
+| `pos_3d` | uniform in [-0.9, 0.9]³ |
 | `size` | log-uniform in `scale_range` (e.g. (0.02, 0.25)) |
 
-Each primitive carries a globally unique `pid` (integer 0..N-1 for
-linked primitives, then N..N+M_A-1 for view-A distractors, etc.). The
-`pid` is the correspondence label.
+Rendered from two camera viewpoints (rotations of the 3D scene about
+the y-axis by ±`view_disparity_deg / 2`, with a small random shared
+x-tilt). Painter's algorithm with depth sort and occlusion.
 
-The scene is rendered from two camera viewpoints (rotations of the
-3D scene around the y-axis by ±`view_disparity_deg / 2`, with a small
-random x-tilt shared between views). Rendering uses a simple pinhole
-projection plus painter's-algorithm depth sort.
-
-### What each render returns
-
-```python
-out = generator.render(scene, view="A")
-out["rgb"]   # (H, W, 3) uint8 image
-out["seg"]   # (H, W) int32 — per-pixel primitive ID, -1 background
-out["kpts"]  # (N_total, 2) float32 — 2D projected centers
-out["vis"]   # (N_total,) bool — primitive visible in this view?
-out["ids"]   # (N_total,) int32 — primitive IDs in canonical order
-```
-
-Correspondence ground truth:
-```python
-pairs = correspondence_pairs(out_A, out_B)
-# pairs: (M, 2, 2) — M matched primitives, each with (x, y) in A and in B
-```
-
-### Styles available for view B
+### Style asymmetry for view B
 
 | Style | Description |
 |---|---|
 | `rgb` | identical rendering style to view A |
-| `grayscale_B` | view B is rendered then desaturated to greyscale |
-| `edges_B` | view B is rendered then run through a Sobel edge detector and inverted, leaving line drawings on white |
+| `grayscale_B` | view B rendered then desaturated to greyscale |
+| `edges_B` | view B rendered then run through a Sobel edge detector and inverted |
 
 Style asymmetry forces the model to learn modality-invariant
-representations, not pixel-matching.
+representations rather than pixel-matching.
+
+### What you get per render
+
+```python
+out = generator.render(scene, view="A")
+out["rgb"]   # (H, W, 3) uint8 image
+out["seg"]   # (H, W) int32 — per-pixel primitive ID; -1 background
+out["kpts"]  # (N_total, 2) float32 — projected centers
+out["vis"]   # (N_total,) bool — visible in this view?
+out["ids"]   # (N_total,) int32 — primitive IDs in canonical order
+```
 
 ### Built-in labels (`compute_label`)
 
 | `kind` | What it computes |
 |---|---|
 | `count_modulo_K` | number of linked primitives mod K |
-| `has_pair` | 1 iff there's a pair of linked primitives with the same shape but different colours |
-| `n_distinct_pairs` | count of distinct (shape, colour) tuples in the linked set |
+| `has_pair` | 1 iff there's a pair with same shape but different colours |
+| `n_distinct_pairs` | count of distinct (shape, colour) tuples |
 
-None of these can be solved by global image statistics alone — they
-require recovering the per-primitive identity in both modalities.
+### Downstream tasks (use Dataset A for these)
+
+| Task | Input | Output | Ground truth from |
+|---|---|---|---|
+| **Image-pair classification** | (img_A, img_B) | one class label | `compute_label(scene)` |
+| **Per-modality segmentation** | img_A (or img_B) | per-pixel pid in {-1, 0..N-1} | `out["seg"]` |
+| **Cross-view keypoint retrieval** | features at primitive centres in A and B | for each kpt in A: top-k match in B | `correspondence_pairs(rA, rB)` |
+| **Dense cross-modal alignment** | (img_A, img_B) | for each (x_A, y_A): its (x_B, y_B) | from `seg_A == pid ↔ seg_B == pid` |
+
+All four tasks have closed-form ground truth.
 
 ---
 
-## 4. Dataset C — Synthetic Event Streams
+## 5. Dataset B — Linked Primitives Video (spatiotemporal)
 
-### Generative process
+**File:** `linked_primitives_video.py`
 
-A scene contains **N linked events** in latent space-time:
+### Generative process — adds trajectories
 
-| Latent | Domain |
+Every primitive from Dataset A now also carries:
+
+| Extra attribute | Domain |
 |---|---|
-| `feat_class_i` | uniform over F feature classes |
-| `f_per_event_i` | `prototype[feat_class_i] + small noise` (ℝ⁴) |
-| `p_latent_i` | uniform on [-0.9, 0.9]² |
-| `τ_i` | uniform on [0, 1] |
+| `trajectory` | one of `static`, `linear`, `sinusoidal`, `circular` (per-primitive sampled per `motion_type` policy) |
+| `lifetime`   | a [τ_birth, τ_death] subset of [0, 1]; primitive is visible only in this window |
 
-A scene-level **cross-modal transform** `T_B` is sampled (one of
-identity, rotation, affine, nonlinear-radial-warp). Modality B's
-spatial positions are obtained by applying `T_B` to the latents. The
-model must learn to *invert* this transform implicitly when learning
-correspondences.
+A scene also has a `cross_modal_time_offset` — view B's effective time
+is τ_A + offset. At higher difficulties this offset is nonzero, modelling
+the realistic case where two sensors aren't perfectly time-synced.
 
-Per-modality renders apply:
-- **Position jitter** δ_i^A, δ_i^B
-- **Time jitter** ε_i^A, ε_i^B
-- **Modality-specific attribute encoders** g_A, g_B — separate linear
-  projections (one of them with a nonlinear tanh squashing) from
-  `f_per_event` into possibly different feature dimensions D_A, D_B.
-  An `attr_corr ∈ [0, 1]` knob controls how aligned the two encoders
-  are: at `corr=1` they're the same encoder; at `corr=0` they're
-  independent random.
+### Trajectory kinds
 
-Around the linked events, M_A and M_B **distractor events** are sampled
-uniformly in space-time with random attributes. Their `src` field is
-set to `-1`. After concatenating linked + distractors, each modality is
-**independently random-permuted** so that event order carries no
-correspondence information.
+| Kind | Closed form |
+|---|---|
+| `static` | `pos(τ) = pos_0` |
+| `linear` | `pos(τ) = pos_0 + v · τ` |
+| `sinusoidal` | `pos(τ) = pos_0 + amp · sin(2π f τ + phase)` (per axis) |
+| `circular` | `pos(τ) = pos_0 + r·(cos(ωτ), sin(ωτ), 0)` |
 
-### What each scene returns
+The operating point's `motion_type` field picks the policy ("static_or_slow_linear", "linear_or_slow_sin", "mixed", or any fixed kind), and `motion_amplitude` scales how aggressive the motion is.
+
+### What you get per render
 
 ```python
-scene = generator.sample_scene(seed=0)
-scene.A_pos    # (K_A, 2)  spatial positions
-scene.A_time   # (K_A,)    timestamps
-scene.A_attrs  # (K_A, D_A) attribute features
-scene.A_src    # (K_A,)    source ID; ≥0 means linked, -1 means distractor
-scene.B_pos, scene.B_time, scene.B_attrs, scene.B_src  # parallel
-scene.transform   # dict describing T_B (so you can probe whether SSL recovers it)
-scene.label
+video = generator.render_video_pair(scene)
+video["times"]                    # (T,) τ values sampled in [0, 1]
+video["view_A"]["rgb"]            # (T, H, W, 3) uint8 video
+video["view_A"]["seg"]            # (T, H, W) int32 per-pixel pid; -1 bg
+video["view_A"]["kpts"]           # (T, N, 2) float32 — projected centers
+video["view_A"]["vis"]            # (T, N) bool — visibility per (frame, primitive)
+video["view_A"]["ids"]            # (N,) int32 — primitive IDs (stable across frames)
+video["view_B"]                   # same structure
 ```
 
-Correspondence ground truth:
+### GIF export
+
 ```python
-pairs = correspondence_indices(scene)
-# pairs: (M, 2) integer indices into A and B (`A_pos[pairs[m, 0]]` ↔ `B_pos[pairs[m, 1]]`)
+generator.save_gif(video["view_A"]["rgb"], "view_A.gif", fps=scene.fps)
+generator.save_gif(video["view_B"]["rgb"], "view_B.gif", fps=scene.fps)
 ```
 
-### Built-in labels (`label_kind`)
+### Built-in labels (`compute_label`)
+
+In addition to the three static labels from Dataset A, two new
+spatiotemporal labels:
 
 | `kind` | What it computes |
 |---|---|
-| `count_modulo_K` | N mod K |
-| `majority_feature` | the most common feature class among linked events |
-| `n_distinct_features` | how many distinct feature classes appear |
-| `transform_class` | coarse type of the cross-modal transform (id/rot/aff/nl) |
+| `has_motion_pattern` | 1 iff at least one primitive has a `circular` or `sinusoidal` trajectory |
+| `n_distinct_motion_kinds` | count of distinct trajectory kinds (`static`/`linear`/`sin`/`circular`) |
+
+### Downstream tasks (use Dataset B for these)
+
+Dataset B subsumes A's tasks (just take frame 0) and adds:
+
+| Task | Input | Output | Ground truth from |
+|---|---|---|---|
+| **Video-pair classification** | (video_A, video_B) | one class label | `compute_label(scene)` |
+| **Spatiotemporal segmentation** | video_A (or B) | per-pixel pid per frame; same pid across frames forms a *tube* | `view_A["seg"]` |
+| **Within-view tracking** | video_A | for each (pid, frame_0) a trajectory of (x, y) in subsequent frames | `cross_time_pairs_within_view` or `trajectories_for_view` |
+| **Cross-view keypoint retrieval over time** | per-frame features | for each (pid, frame_t) in A: match in B at the same time | `cross_view_pairs_at_time(video, t)` |
+| **Cross-view + cross-time matching** | per-frame features | for each (pid, view_A, τ₁) → (view_B, τ₂) | pid intersection across all `ids` |
+| **Dense optical flow within view** | (frame_t, frame_{t+1}) of view_A | per-pixel motion vector | finite-difference of per-pid kpts in `view_A["kpts"]` |
+| **Motion-conditioned classification** | full video pair | the new labels `has_motion_pattern` / `n_distinct_motion_kinds` | `compute_label(scene, kind=...)` |
+
+All seven tasks have closed-form ground truth from the latent scene.
 
 ---
 
-## 5. Operating points — the "arbitrary complexity" axis
+## 6. Operating points — the "arbitrary complexity" axis
 
-Both datasets ship with **five named operating points**:
+Both datasets ship with **five named operating points** with parallel
+naming so an SSL method can be evaluated on equivalent settings of both.
+
+### Static (Dataset A)
 
 | Knob | EASY | BASIC | HARD | EXTREME | ADVERSARIAL |
 |---|---|---|---|---|---|
-| n_linked | 4 / 8 | 16 / 32 | 64 / 128 | 128 / 256 | 128 / 256 |
-| n_shapes (A) / n_features (C) | 2 | 4 | 8 | 10 | 10 |
-| view disparity (A) / transform (C) | 30° / identity | 60° / rotation | 120° / affine | 170° / nonlinear | 170° / nonlinear |
-| distractors per modality | 0 | 2–4 | 16–32 | 48–128 | 64–192 |
-| scale range (A) / attr_corr (C) | small | small | medium | full | full |
-| style gap (A) | rgb=rgb | rgb=rgb | rgb vs grayscale | rgb vs edges | rgb vs edges |
-| noise σ (A) / position jitter (C) | 0 | 0.02 | 0.05 | 0.08 | 0.10 |
-| adversarial confusables (A) | — | — | — | — | yes |
+| n_linked | 4 | 16 | 64 | 128 | 128 |
+| n_shapes | 2 | 4 | 8 | 10 | 10 |
+| view disparity | 30° | 60° | 120° | 170° | 170° |
+| distractors per modality | 0 | 2 | 16 | 48 | 64 |
+| scale range | (0.10, 0.15) | (0.06, 0.16) | (0.03, 0.20) | (0.02, 0.25) | (0.02, 0.25) |
+| style on B | rgb | rgb | grayscale | edges | edges |
+| noise σ | 0 | 0.02 | 0.05 | 0.08 | 0.10 |
+| adversarial confusables | — | — | — | — | yes |
 
-For one-knob ablations, build a custom dict instead of passing a name:
+### Spatiotemporal (Dataset B — adds temporal knobs)
 
+Inherits the spatial knobs above, plus:
+
+| Knob | EASY | BASIC | HARD | EXTREME | ADVERSARIAL |
+|---|---|---|---|---|---|
+| motion type policy | static_or_slow_linear | linear_or_slow_sin | mixed | mixed | mixed |
+| motion amplitude | 0.0 | 0.20 | 0.35 | 0.50 | 0.60 |
+| n_frames | 8 | 12 | 16 | 24 | 24 |
+| fps | 8 | 8 | 8 | 12 | 12 |
+| lifetime jitter | 0.0 | 0.0 | 0.15 | 0.30 | 0.30 |
+| cross-modal time offset | 0.0 | 0.0 | 0.01 | 0.02 | 0.03 |
+
+For one-knob ablations, pass a `dict` instead of a name:
 ```python
 custom = dict(OPERATING_POINTS["basic"])
-custom["n_linked"] = 128       # vary just this knob
-gen = LinkedPrimitivesGenerator(operating_point=custom)
+custom["motion_amplitude"] = 0.8       # vary just this
+gen = LinkedPrimitivesVideoGenerator(operating_point=custom)
 ```
 
 ---
 
-## 6. Evaluation protocol — the three metrics
+## 7. Evaluation protocol — three metrics, evaluated per operating point
 
-A multimodal SSL method should be measured on **three orthogonal axes**,
-not one:
+A multimodal SSL method should be measured on **three orthogonal axes**:
 
 ### (i) Direct correspondence-retrieval accuracy
 
-Encode every primitive (linked + distractor) in both modalities. For
-each primitive's feature in modality A, retrieve the top-k nearest
-neighbours in modality B (by cosine similarity or Euclidean distance).
-Report top-1 / top-5 accuracy at finding the correct corresponding
+Encode every primitive feature in both modalities. For each primitive
+in modality A, retrieve top-k nearest neighbours in modality B by cosine
+similarity. Report top-1 / top-5 accuracy at finding the corresponding
 primitive.
 
-This is the **clean isolated test** of correspondence learning.
-Random features = 1/N accuracy. Perfect features = 100%. The middle is
-the interesting regime.
+The **clean isolated test** of correspondence learning. Random features
+give 1/N accuracy.
 
 ### (ii) Linear-probe classification on φ(z)
 
-Standard SSL probe. Train a linear classifier on the SSL features to
-predict the latent-derived label. Because `φ` depends on the latents
-not the image, this can't be cheated with global statistics — *unless*
-the operating point is so easy that one-modality features alone suffice
-(which is why operating-point sweeps are essential).
+Standard SSL probe. Train a linear classifier on SSL features → label.
+Because φ depends on the latents not the rendered pixels, this can't be
+cheated by global statistics *unless* the operating point is so easy
+that one-modality features alone suffice.
 
-### (iii) Cross-modal dense segmentation
+### (iii) Cross-modal dense segmentation (and, for B, cross-time tracking)
 
-For each pixel (linked-primitives) or event (event streams) in modality
-A that belongs to primitive `p`, predict the corresponding pixel/event
-in modality B that belongs to the same primitive. Treat this as a
-classification problem over the N primitives in the scene. Report
-mIoU / per-primitive top-1 accuracy.
+For each pixel / event in modality A belonging to primitive `p`, predict
+the corresponding pixel / event in modality B that belongs to the same
+primitive. mIoU / per-primitive top-1 accuracy.
 
-This is the **fine-grained correspondence quality** metric. Most direct
-test of "does the SSL representation know which-thing-is-which".
+For dataset B, the same metric extends to tracking: for each `(pid,
+frame_t)` predict its `(x, y)` at `frame_{t+k}`. RMSE in pixel
+coordinates is the standard tracking metric.
 
 ### Reading the three together
 
-| (i) Retrieval | (ii) Probe | (iii) Cross-modal seg | Interpretation |
+| (i) Retrieval | (ii) Probe | (iii) Dense correspondence | Interpretation |
 |---|---|---|---|
 | high | high | high | The model has learned correspondences cleanly. |
-| low | high | low | Shortcut — global statistics solve the label. **Increase difficulty.** |
-| high | low | high | Correspondences known but linear probe insufficient. Try a stronger head. |
-| low | low | low | SSL is not getting traction. Try a different operating point or recipe. |
+| low | high | low | Shortcut: global statistics solve the label. Increase difficulty. |
+| high | low | high | Correspondences known, head insufficient. Try a stronger probe. |
+| low | low | low | SSL is not getting traction. Try a different recipe. |
 
 ---
 
-## 7. Files in this folder
+## 8. Files in this folder
 
 | File | Purpose |
 |---|---|
-| `linked_primitives.py` | Dataset A generator: `Primitive`, `Scene`, `LinkedPrimitivesGenerator`, `correspondence_pairs` helper. Pure-Python (numpy + PIL). |
-| `synth_event_streams.py` | Dataset C generator: `EventStreamScene`, `SyntheticEventStreamsGenerator`, `correspondence_indices` helper. Pure numpy. |
-| `correspondence_viz.ipynb` | Walkthrough notebook: instantiates both generators at all five operating points, plots renders + correspondences + label distributions. |
+| `linked_primitives.py` | Dataset A generator: `Primitive`, `Scene`, `LinkedPrimitivesGenerator`, `correspondence_pairs`. Pure numpy + PIL. |
+| `linked_primitives_video.py` | Dataset B generator: `Trajectory`, `STPrimitive`, `STScene`, `LinkedPrimitivesVideoGenerator`, three correspondence helpers, `save_gif`. Imports and reuses Dataset A's rendering primitives. |
+| `correspondence_viz.ipynb` | Walkthrough notebook: scenes + correspondences at every operating point for both datasets, with GIF export demo for B. |
 | `_build_correspondence_viz.py` | Generator script for the notebook. |
 | `README.md` | This file. |
 
-The generators are **fully self-contained**. No torch dependency. They
-can be used standalone to generate datasets that any framework
-(PyTorch, JAX, anything) can consume.
+Both generators are **fully self-contained**: numpy + PIL only, no torch
+or other ML-framework dependency.
 
 ---
 
-## 8. Quick API tour
+## 9. Quick API tour
+
+### Dataset A (static)
 
 ```python
 from linked_primitives import LinkedPrimitivesGenerator, correspondence_pairs
@@ -309,70 +347,70 @@ gen = LinkedPrimitivesGenerator(operating_point="basic", image_size=128)
 scene = gen.sample_scene(seed=0)
 view_A = gen.render(scene, view="A")
 view_B = gen.render(scene, view="B")
-pairs = correspondence_pairs(view_A, view_B)           # (M, 2, 2): M matched pairs
+pairs = correspondence_pairs(view_A, view_B)          # (M, 2, 2)
 label = gen.compute_label(scene, kind="count_modulo_K", K=4)
 ```
 
-```python
-from synth_event_streams import SyntheticEventStreamsGenerator, correspondence_indices
+### Dataset B (spatiotemporal)
 
-gen = SyntheticEventStreamsGenerator(operating_point="hard")
+```python
+from linked_primitives_video import (
+    LinkedPrimitivesVideoGenerator,
+    cross_view_pairs_at_time, cross_time_pairs_within_view, trajectories_for_view,
+)
+
+gen = LinkedPrimitivesVideoGenerator(operating_point="hard", image_size=128)
 scene = gen.sample_scene(seed=0)
-# scene.A_pos: (K_A, 2), scene.A_attrs: (K_A, D_A), ...
-pairs = correspondence_indices(scene)                   # (M, 2) idx pairs
-label = scene.label                                      # already computed
+video = gen.render_video_pair(scene)
+# Save GIFs
+gen.save_gif(video["view_A"]["rgb"], "view_A.gif", fps=scene.fps)
+gen.save_gif(video["view_B"]["rgb"], "view_B.gif", fps=scene.fps)
+# Correspondences
+pairs_xv  = cross_view_pairs_at_time(video, t_idx=0)               # (M, 2, 2)
+pairs_xt  = cross_time_pairs_within_view(video, "A", 0, 5)          # (M, 2, 2)
+trajs     = trajectories_for_view(video, "A")                       # {pid: (T, 2)}
+label = gen.compute_label(scene, kind="has_motion_pattern")
 ```
 
 ---
 
-## 9. Extending the benchmark
+## 10. Extending the benchmark
 
-The intent is for this to be **extensible**. The clean extension points:
+- **New label functions**: add a branch to `compute_label`. The contract
+  is that the label is a function of the latent scene only.
+- **New trajectory kinds**: add a branch to `_sample_trajectory` and a
+  matching branch to `Trajectory.pos_at`. Any closed-form
+  `f(τ): [0,1] → ℝ³` works.
+- **New styles**: add a style tag to the render switch.
+- **More than 2 modalities**: both files have clean A/B separation;
+  adding a third view is mostly mechanical (sample a new camera matrix
+  + a new render call).
+- **New shapes**: append to `SHAPES` and add a `_draw_shape` branch.
+- **New operating points**: add a dict to `OPERATING_POINTS`.
 
-- **New label functions.** Add a branch to `compute_label`. The contract
-  is that the label must be a function of the latent scene only.
-- **New cross-modal transforms.** Add a kind to `_build_transform` /
-  `_apply_transform` in `synth_event_streams.py`. Any function
-  `T: ℝ² → ℝ²` works.
-- **New styles.** Add a style tag to the render switch in
-  `linked_primitives.py`. Currently `rgb / grayscale / edges`.
-- **More modalities.** Both files have clean A/B separation; adding a
-  third modality is mostly mechanical (sample a new render / encoder).
-- **New shapes.** Append to `SHAPES` and add a `_draw_shape` branch.
-- **New operating points.** Add a dict to `OPERATING_POINTS`. Naming
-  convention: one of `easy/basic/hard/extreme/adversarial` or a
-  descriptive custom name.
-
-The downstream SSL evaluation (the three metrics in §6) is **dataset-
-agnostic** — it operates on whatever (modality_A_features,
-modality_B_features, correspondences, labels) tuple your dataset
-returns. Adding new datasets does not require changing the evaluation.
+The evaluation protocol is dataset-agnostic — it operates on whatever
+`(modality_features, correspondences, labels)` tuple the dataset
+returns.
 
 ---
 
-## 10. The bigger plan this benchmark serves
+## 11. The bigger plan this benchmark serves
 
-This dataset is intended to test the central hypothesis of the
-sparse-input SSL line of work:
+Test the central hypothesis of the sparse-input SSL line of work:
 
 > Multi-scale, position-aware aggregators (RoPE / HRR / spectral) should
 > outperform PointNet-style max-pool aggregators when the downstream
-> task requires fine-grained spatial correspondence — and this
-> advantage should grow with task difficulty.
+> task requires fine-grained spatial *or spatiotemporal* correspondence —
+> and this advantage should grow with task difficulty.
 
-On CIFAR-10 with a 6-layer encoder, the three aggregators converge to
-the same accuracy because the dataset doesn't punish lossy aggregation.
-On this benchmark, **the difficulty knobs explicitly amplify the
-information loss that an inadequate aggregator suffers**. Two adversarial
-near-duplicate primitives can be told apart only if the aggregator
-preserves enough spatial-spectral detail to distinguish them at the
-patch level.
+On CIFAR-10 the three aggregators converged because the dataset didn't
+punish lossy aggregation. On this benchmark the difficulty knobs
+explicitly amplify the information loss: adversarial near-duplicate
+primitives, fast motion that smears appearance across frames,
+cross-modal time offsets that require alignment.
 
-If the hypothesis holds, the difficulty × accuracy curve should:
-- be flat (all methods tie) at EASY,
-- start spreading at HARD,
-- show a wide gap at EXTREME and ADVERSARIAL,
-- with RoPE/HRR pulling ahead of PointNet specifically when the per-
-  patch event entropy is the bottleneck.
-
-That curve is the headline figure.
+Expected curves: flat at EASY (all methods tie), spreading at HARD,
+wide gap at EXTREME/ADVERSARIAL. Dataset B specifically tests whether
+the aggregator advantage extends to motion — RoPE/HRR's spectral
+decomposition should remain stable under controlled motion, while
+PointNet's max-pool may struggle to track shifting features.
