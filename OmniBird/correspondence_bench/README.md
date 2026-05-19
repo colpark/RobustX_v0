@@ -342,12 +342,137 @@ coordinates is the standard tracking metric.
 |---|---|
 | `linked_primitives.py` | Dataset A generator: `Primitive`, `Scene`, `LinkedPrimitivesGenerator`, `correspondence_pairs`. Pure numpy + PIL. |
 | `linked_primitives_video.py` | Dataset B generator: `Trajectory`, `STPrimitive`, `STScene`, `LinkedPrimitivesVideoGenerator`, three correspondence helpers, `save_gif`. Imports and reuses Dataset A's rendering primitives. |
-| `correspondence_viz.ipynb` | Walkthrough notebook: scenes + correspondences at every operating point for both datasets, with GIF export demo for B. |
-| `_build_correspondence_viz.py` | Generator script for the notebook. |
-| `README.md` | This file. |
+| `multiview_primitives.py` | Dataset C generator: 3-camera variant with narrow FOV. `MultiViewLinkedPrimitivesGenerator`, `cross_view_pairs_triple`, `coverage_summary`. Primitives invisible in every camera are dropped at sampling time so labels are always recoverable. |
+| `augmenters.py` | Observation-channel augmenters (noise, sparsity, occlusion, image-FOV crop). Composable via `AugmenterPipeline`. **Noise is no longer baked into the renderers** — it's an independent axis controlled here. |
+| `generate_dataset.py` | Standalone CLI + library for generating NPZ datasets. Combines any (dataset, operating_point, augmenter_pipeline) tuple. |
+| `correspondence_viz.ipynb` | Walkthrough for Datasets A and B: scenes + correspondences at every operating point, GIF export, all downstream tasks demoed. |
+| `sparse_viz.ipynb` | Walkthrough for the sparse / occluded / limited-FOV variants (Dataset C + augmenters). |
+| `_build_*.py` | Generator scripts for the notebooks. |
 
-Both generators are **fully self-contained**: numpy + PIL only, no torch
-or other ML-framework dependency.
+All generators and augmenters are **fully self-contained**: numpy + PIL
+only, no torch or other ML-framework dependency.
+
+## 9. Augmenters — observation-channel modifications
+
+Noise, sparsity, occlusion, and image-FOV cropping are **independent of
+the operating-point difficulty axis**. They're implemented as augmenters
+that post-process rendered outputs:
+
+```python
+from augmenters import (
+    GaussianNoiseAugmenter, RandomSubsampleAugmenter,
+    CenterOcclusionAugmenter, LimitedFOVAugmenter, AugmenterPipeline,
+)
+pipeline = AugmenterPipeline([
+    RandomSubsampleAugmenter(0.4),    # drop 60% of pixels
+    CenterOcclusionAugmenter(0.3),    # 30% × 30% center mask
+    GaussianNoiseAugmenter(0.05),     # then noise
+])
+observed = pipeline(rendered_output, rng=42)
+```
+
+This lets you compose any of `(operating_point) × (augmenter_pipeline)`
+without coupling. Each augmenter has its own docstring detailing
+behaviour and parameter ranges; see `augmenters.py`.
+
+## 10. Dataset C — Multi-View Limited FOV
+
+**File:** `multiview_primitives.py`
+
+A third dataset designed for **multi-view scene-understanding** SSL.
+N (=3 by default) cameras with **narrow FOV** (focal=4.0, vs 2.0 in A/B)
+tile the scene at angles +13° / 0° / −13°. Each camera sees roughly
+half of what a single wide-FOV camera would see; their union covers
+approximately the same angular extent.
+
+### Generative process — visibility guarantee
+
+The whole point of limited FOV is that each individual view shows only
+PART of the scene. For downstream "scene understanding" to be tractable,
+**every primitive that contributes to the label must be observable
+somewhere**. The generator enforces this:
+
+1. Sample 3× the requested number of candidate primitives.
+2. Drop any candidate whose projection center is outside every camera's
+   FOV.
+3. Truncate the surviving set to the requested `n_linked`.
+
+Primitives in `scene.unobservable` (those dropped at step 2) are
+returned for diagnostics but do not contribute to labels or
+correspondence ground truth.
+
+A `coverage_summary(renders, n_linked)` helper reports actual rendered
+visibility per view; typical numbers across difficulty:
+
+| Operating point | n_linked | post-render coverage (visible in ≥1 view) |
+|---|---|---|
+| easy | 8 | 1.00 |
+| basic | 24 | 0.98 |
+| hard | 80 | 0.92 |
+| extreme | 100 | 0.80 |
+| adversarial | 100 | 0.78 |
+
+(Coverage <1.0 at extreme is due to painter's-algorithm occlusion — a
+front primitive can write its `pid` over a back one's pixels. This is
+a realistic difficulty knob, not a bug.)
+
+### Downstream tasks (use Dataset C for these)
+
+| Task | Input | Output | Ground truth from |
+|---|---|---|---|
+| **C-1 Multi-view classification** | features from all N views | one class label | `compute_label(scene)` over filtered linked set |
+| **C-2 Per-view segmentation** | one view's image | per-pixel pid in that view | `renders[v]["seg"]` |
+| **C-3 Cross-view pairing (all triples)** | per-view features | for each (i, j) pair of views: matched primitive kpts | `cross_view_pairs_triple(renders, i, j)` |
+| **C-4 Coverage / view-completion** | features from a subset of views | predict properties of an unseen view (e.g. mask cam 0, predict from cams 1+2) | `coverage_summary` + pid intersection |
+
+Built-in labels for C-1:
+- `count_modulo_K`, `has_pair`, `n_distinct_shapes` (same shapes as A)
+- `spans_all_views` — 1 iff any primitive is observable in **every** view
+  (a different statistic — tests whether the model can find primitives
+  that survive the most restrictive view intersection)
+
+## 11. Generating data with `generate_dataset.py`
+
+CLI usage:
+
+```bash
+# Static dataset, basic difficulty, with 5% Gaussian noise:
+python generate_dataset.py --dataset static \
+    --operating-point basic --n 1000 \
+    --noise-sigma 0.05 \
+    --out ./data/basic_n1000_noise05
+
+# Video, mixed_hz, sparse 40% keep:
+python generate_dataset.py --dataset video \
+    --operating-point mixed_hz --n 200 \
+    --subsample 0.4 \
+    --out ./data/mixed_hz_sparse40
+
+# Multi-view, hard difficulty, with center occlusion:
+python generate_dataset.py --dataset multiview \
+    --operating-point hard --n 500 \
+    --occlude 0.3 \
+    --out ./data/mv_hard_occluded
+```
+
+Library usage:
+
+```python
+from generate_dataset import generate
+from augmenters import GaussianNoiseAugmenter, RandomSubsampleAugmenter
+
+summary = generate(
+    dataset="multiview",
+    operating_point="basic",
+    n_scenes=100,
+    augmenters=[GaussianNoiseAugmenter(0.05), RandomSubsampleAugmenter(0.5)],
+    out_dir="./data/mv_basic_sparse",
+)
+```
+
+Each scene is saved as an NPZ with all view RGBs, segmentation maps,
+keypoints, visibility flags, primitive IDs, and the label. A
+`manifest.json` summarises the run.
 
 ---
 

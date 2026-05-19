@@ -516,13 +516,10 @@ class LinkedPrimitivesVideoGenerator:
             inv = 255 - mag
             rgb_arr = np.stack([inv, inv, inv], axis=-1)
 
-        # Noise (deterministic per (seed, view, frame index))
-        if scene.noise_sigma > 0:
-            tag = int(round(tau * 1000)) + (1000 if view == "B" else 0)
-            noise = np.random.RandomState(scene.seed + tag).normal(
-                0, scene.noise_sigma * 255, rgb_arr.shape
-            )
-            rgb_arr = (rgb_arr.astype(np.float32) + noise).clip(0, 255).astype(np.uint8)
+        # Noise is no longer applied here — see augmenters.py for the
+        # noise / sparsity / occlusion / FOV-restriction layer. Renderer
+        # outputs are clean and deterministic; the observation channel is
+        # built up by composing augmenters on top.
 
         # Per-primitive keypoints + visibility
         ids = np.array([p.pid for p in primitives], dtype=np.int32)

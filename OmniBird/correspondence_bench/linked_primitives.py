@@ -346,7 +346,11 @@ class LinkedPrimitivesGenerator:
         seg_arr = np.array(seg_img, dtype=np.int32)
         rgb_arr = np.array(rgb_img, dtype=np.uint8)
 
-        # Apply style transform to view B
+        # Apply style transform to view B.
+        # NOTE: noise is no longer applied here — it is a separate concern,
+        # handled by augmenters in augmenters.py. The renderer produces
+        # clean, deterministic outputs. To add observation noise, wrap the
+        # output in a GaussianNoiseAugmenter (or compose with other augmenters).
         if style == "grayscale":
             gray = (0.299 * rgb_arr[..., 0]
                     + 0.587 * rgb_arr[..., 1]
@@ -364,13 +368,6 @@ class LinkedPrimitivesGenerator:
             mag = (mag / max(mag.max(), 1e-6) * 255).clip(0, 255).astype(np.uint8)
             inv = 255 - mag
             rgb_arr = np.stack([inv, inv, inv], axis=-1)
-
-        # Add Gaussian noise
-        if scene.noise_sigma > 0:
-            noise = np.random.RandomState(scene.seed + (0 if view == "A" else 1)).normal(
-                0, scene.noise_sigma * 255, rgb_arr.shape
-            )
-            rgb_arr = (rgb_arr.astype(np.float32) + noise).clip(0, 255).astype(np.uint8)
 
         # Build kpts + vis arrays in canonical order (linked, then distractors)
         kpts = np.full((len(primitives_present), 2), np.nan, dtype=np.float32)
