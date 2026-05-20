@@ -227,7 +227,127 @@ print("Saved → sensor_sampling_patterns.png")
 
 
 # =============================================================================
-md(r"""## §4. Reading the figure
+md(r"""## §4. FOV vs scene extent — the "FOV is tiny" problem
+
+The image-plane figure above shows what's INSIDE each sensor's FOV.
+A separate concern is **how small that FOV is compared to the scene**
+the sensor is supposed to observe. Cameras see a narrow horizontal
+sector with finite depth-range; the rest of the world is invisible.
+The figure below is a top-down view of a 10 m × 10 m scene, with
+each sensor at the center, looking up (+y), and that sensor's FOV cone
+overlaid in colour. Each panel reports the coverage percentage of the
+scene area that the sensor can observe.
+""")
+code(r"""import math
+from matplotlib.patches import Polygon, Rectangle, Circle
+
+# Scene size (square room in metres) — much larger than any sensor's FOV
+SCENE_W = SCENE_H = 10.0
+SENSOR_XY = (SCENE_W / 2, SCENE_H / 2)
+LOOK_ANGLE_DEG = 90.0    # cameras look "up" (+y) in this top-down diagram
+
+# Per-sensor characteristics (typical real-world values, top-down view).
+# 'depth' is the maximum operating range in metres. LiDAR is omnidirectional
+# so it doesn't have a directional 'angle'; we encode that with kind='disk'.
+SENSORS = [
+    dict(name="RGB camera",   kind="cone", color="#377eb8",
+         hfov_deg=70.0,  range_m=5.0),
+    dict(name="IR thermal",   kind="cone", color="#d97316",
+         hfov_deg=40.0,  range_m=8.0),
+    dict(name="Depth camera", kind="cone", color="#4caf50",
+         hfov_deg=70.0,  range_m=3.0),
+    dict(name="EBC",          kind="cone", color="#e53935",
+         hfov_deg=70.0,  range_m=5.0),
+    dict(name="LiDAR rot.",   kind="disk", color="#7b1fa2",
+         range_m=12.0),   # > scene half-diagonal → covers whole room
+]
+
+
+def cone_polygon(origin, look_deg, hfov_deg, depth, n_arc=24):
+    cx, cy = origin
+    half = math.radians(hfov_deg / 2.0)
+    center = math.radians(look_deg)
+    pts = [(cx, cy)]
+    for i in range(n_arc + 1):
+        t = i / n_arc
+        ang = center - half + t * 2 * half
+        pts.append((cx + depth * math.cos(ang), cy + depth * math.sin(ang)))
+    return pts
+
+
+def disk_polygon(origin, radius, n=64):
+    cx, cy = origin
+    return [(cx + radius * math.cos(2 * math.pi * i / n),
+             cy + radius * math.sin(2 * math.pi * i / n))
+            for i in range(n)]
+
+
+def polygon_area_in_scene(polygon_pts, scene_w, scene_h, mc_n=20000, rng=None):
+    # Monte-Carlo estimate of polygon area intersected with the scene rectangle.
+    if rng is None: rng = np.random.RandomState(0)
+    pts = np.asarray(polygon_pts)
+    xs = rng.uniform(0, scene_w, mc_n); ys = rng.uniform(0, scene_h, mc_n)
+    # ray-cast point-in-polygon
+    inside = np.zeros(mc_n, dtype=bool)
+    n_v = len(pts)
+    for i in range(n_v):
+        x0, y0 = pts[i]; x1, y1 = pts[(i + 1) % n_v]
+        cond = ((y0 > ys) != (y1 > ys))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            x_int = (x1 - x0) * (ys - y0) / (y1 - y0 + 1e-12) + x0
+        inside ^= cond & (xs < x_int)
+    return float(inside.mean()) * (scene_w * scene_h), scene_w * scene_h
+
+
+# ---- figure ----
+fig, axes = plt.subplots(1, len(SENSORS), figsize=(3.6 * len(SENSORS), 4.4))
+for ax, sensor in zip(axes, SENSORS):
+    # Scene outline
+    ax.add_patch(Rectangle((0, 0), SCENE_W, SCENE_H,
+                            facecolor='#fafafa', edgecolor='black', linewidth=1.6))
+    # Build FOV polygon
+    if sensor["kind"] == "cone":
+        poly_pts = cone_polygon(SENSOR_XY, LOOK_ANGLE_DEG,
+                                 sensor["hfov_deg"], sensor["range_m"])
+    else:
+        poly_pts = disk_polygon(SENSOR_XY, sensor["range_m"])
+    # Clip-and-shade the FOV (we just draw the polygon; scene boundary
+    # crops it visually via xlim/ylim)
+    ax.add_patch(Polygon(poly_pts, facecolor=sensor["color"], alpha=0.5,
+                          edgecolor=sensor["color"], linewidth=1.4))
+    # Sensor marker
+    ax.plot(*SENSOR_XY, marker='o', color='black', markersize=7, zorder=5)
+    ax.plot(*SENSOR_XY, marker='o', color='white', markersize=4, zorder=6)
+
+    # Coverage estimate (Monte Carlo inside scene)
+    covered, scene_area = polygon_area_in_scene(
+        poly_pts, SCENE_W, SCENE_H, mc_n=30000,
+        rng=np.random.RandomState(0))
+    coverage_pct = 100.0 * covered / scene_area
+
+    ax.set_xlim(0, SCENE_W); ax.set_ylim(0, SCENE_H); ax.set_aspect('equal')
+    ax.set_xticks([]); ax.set_yticks([])
+    for side in ("top", "right", "bottom", "left"):
+        ax.spines[side].set_linewidth(3.0); ax.spines[side].set_edgecolor("black")
+    ax.set_title(sensor["name"], fontsize=14, weight='bold', pad=10)
+    if sensor["kind"] == "cone":
+        descr = f"HFOV {sensor['hfov_deg']:.0f}°, range {sensor['range_m']:.0f} m"
+    else:
+        descr = f"360° H, range {sensor['range_m']:.0f} m"
+    ax.set_xlabel(f"{descr}\ncovers ≈ {coverage_pct:5.1f}% of scene",
+                   fontsize=10, labelpad=8)
+
+plt.suptitle("FOV vs scene — top-down view of a 10 m × 10 m room "
+              "(sensor at center, cameras looking +y)",
+              fontsize=14, y=1.04)
+plt.tight_layout()
+plt.savefig("fov_vs_scene.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved → fov_vs_scene.png")
+""")
+
+
+md(r"""## §5. Reading the figure
 
 Two signatures per tile — **FOV shape** (the dashed grey rectangle)
 and **sampling density inside it** (the black dots):
@@ -256,6 +376,23 @@ The benchmark's `multiview_primitives.py` simulates LiDAR, Infrared,
 and Depth as three different views of the sensor-fusion variant; the
 FOV mismatches shown here are part of why **no single modality is
 sufficient** to recover the latent scene.
+
+## §6. The two FOV problems together
+
+Combining the two figures:
+
+* The first figure shows **how each sensor samples inside its FOV** —
+  density and structure on the image plane.
+* The second figure shows **how small that FOV is relative to the
+  scene** — the world the sensor is supposed to observe.
+
+Both matter and they cause different kinds of failure. A model that
+handles a sparse within-FOV pattern (e.g. LiDAR rings) but can't
+integrate across the small fraction of the scene it sees will still
+miss most of the world. Conversely, a model that aggregates well
+across cameras with wide angular coverage will still misread the
+sensor's local sample structure if it doesn't respect the within-FOV
+pattern. Sensor-fusion SSL has to handle both axes simultaneously.
 """)
 
 
