@@ -1,18 +1,25 @@
-"""Build correspondence_bench/data_schemes.ipynb — a single-figure overview
-of the five sensor modalities the benchmark supports, rendered from the
-same underlying scene so the diversity of sensor signatures is visible
-side-by-side.
+"""Build correspondence_bench/data_schemes.ipynb — a schematic figure of
+the stereotypical SAMPLING PATTERNS of five real-world sensor modalities.
 
-The five modalities, in order:
-    1. Dense RGB          — standard wide-FOV camera
-    2. Infrared           — temperature heatmap (inferno)
-    3. Depth camera       — viridis colormap on per-pixel depth
-    4. EBC (event camera) — pixel polarity from frame-to-frame diff
-                            (red = positive event, blue = negative)
-    5. LiDAR              — sparse depth returns on dark background
+The figure shows WHERE each sensor takes samples in the image plane,
+abstracted away from any scene content. Each tile is a square frame
+with thick black borders containing black dots at the sensor's
+characteristic measurement locations:
 
-Each tile gets a thick black border to read as a schematic / figure-grade
-illustration.
+  1. RGB camera     — dense regular grid (every pixel a sample)
+  2. IR thermal     — dense regular grid at coarser resolution
+                      (typical IR sensors are ~160x120 vs RGB at ~1080p)
+  3. Depth camera   — dense grid with characteristic "depth holes"
+                      (random missing pixels from reflective surfaces,
+                      out-of-range objects, depth discontinuities)
+  4. EBC            — sparse asynchronous events
+                      (only triggered on intensity changes,
+                      output is unstructured x-y points)
+  5. LiDAR (spinning) — horizontal scan rings
+                      (a rotating sensor produces N rings of points,
+                      each ring a row of horizontal samples)
+
+No scene content; the figure is purely about WHERE each sensor measures.
 """
 import json, os
 NB = "/Users/davidpark/Documents/Claude/NFJEPA/OmniBird/correspondence_bench/data_schemes.ipynb"
@@ -23,214 +30,187 @@ def code(s): cells.append({"cell_type":"code","metadata":{},"execution_count":No
 
 
 # =============================================================================
-md(r"""# Data Schemes — five sensor modalities, one scene
+md(r"""# Sensor Data Schemes — sampling patterns of five real-world modalities
 
-A single-row schematic showing the five sensor modalities supported by
-`correspondence_bench`, each rendered from the **same underlying scene**.
-The figure exists to make the diversity of sensor signatures concrete
-in one image — what each kind of data actually LOOKS LIKE.
+A schematic figure intended for slides or papers. **No scene content** —
+each tile shows the characteristic SAMPLING PATTERN of one sensor type:
+WHERE the sensor takes measurements in the image plane, abstracted from
+any image.
 
-| # | Modality | Density | Signal carried per pixel | Where it comes from |
-|---|---|---|---|---|
-| 1 | **Dense RGB**           | dense   | colour + intensity                | `LinkedPrimitivesGenerator` (standard render) |
-| 2 | **Infrared**            | dense   | pseudo-temperature → inferno cmap | `InfraredModality` |
-| 3 | **Depth camera**        | dense   | z-distance → viridis cmap         | `DepthCameraModality` |
-| 4 | **EBC** (event camera)  | **sparse** | binary polarity per pixel (per Δt) | simulated here from a frame-to-frame diff of `LinkedPrimitivesVideoGenerator` |
-| 5 | **LiDAR**               | **sparse** | depth at a random ~15% of returns | `LiDARModality` |
+| # | Sensor | Pattern in one sentence |
+|---|---|---|
+| 1 | **RGB camera** | dense regular grid; every pixel is sampled |
+| 2 | **IR thermal** | dense regular grid at coarser resolution (typically ~160x120 vs RGB 1080p) |
+| 3 | **Depth camera** | dense grid with characteristic "depth holes" — random missing pixels from reflective surfaces and depth discontinuities |
+| 4 | **EBC** (event-based camera) | sparse asynchronous events, triggered only by per-pixel intensity changes — output is an unstructured cloud of `(x, y, t, polarity)` |
+| 5 | **LiDAR** (rotating) | horizontal scan rings — a rotating sensor produces N rows of points, each at a fixed vertical angle |
 
-The five tiles are illustrated in a single row with thick black borders
-— intended as a slide / paper figure.
+Each tile is rendered as black dots on a white background inside a
+thick-black-border square. The figure is generated entirely from a few
+lines of numpy — no scene generator is involved.
 """)
 
 
 # =============================================================================
 md("## §1. Setup")
-code(r"""import os, sys, math
-sys.path.insert(0, os.path.abspath('.'))
-import numpy as np
+code(r"""import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-
-from linked_primitives import (
-    LinkedPrimitivesGenerator, _project, FOCAL_DEFAULT, CAMERA_BACK_DEFAULT,
-)
-from linked_primitives_video import LinkedPrimitivesVideoGenerator
-from modalities import InfraredModality, DepthCameraModality, LiDARModality
-
 np.random.seed(0)
 """)
 
 
 # =============================================================================
-md(r"""## §2. Helpers
+md(r"""## §2. Sampling-pattern generators
 
-Two small helpers:
-
-* `enrich_with_depth_meta` — adds the `depth` and `primitives_meta` fields
-  to a static render so the modality classes (which expect them) can run.
-* `simulate_ebc` — generates an event-camera image from two RGB frames:
-  red for positive polarity (intensity went up), blue for negative,
-  black where no event fired.
+Each function returns `(N, 2)` array of `(x, y)` sample locations in the
+unit square `[0, 1]^2`. The five sensors:
 """)
-code(r"""# enrich_with_depth_meta — adds depth + primitives_meta to a static render so
-# the modality classes (which need both) can be invoked on it.
-def enrich_with_depth_meta(scene, render_out, view="A"):
-    view_mat = scene.view_A if view == "A" else scene.view_B
-    prims = scene.linked + (scene.distractors_A if view == "A" else scene.distractors_B)
-    depth = np.full(render_out["seg"].shape, np.nan, dtype=np.float32)
-    for p in prims:
-        screen, z = _project(p.pos_3d, view_mat,
-                              focal=FOCAL_DEFAULT, camera_back=CAMERA_BACK_DEFAULT)
-        if screen is None: continue
-        depth[render_out["seg"] == p.pid] = z
-    out = {**render_out, "depth": depth,
-           "primitives_meta": {p.pid: (p.shape_id, p.color_idx) for p in prims}}
+code(r"""# Dense regular grid — every pixel sampled (RGB camera).
+def pattern_rgb_camera(grid=28):
+    xs, ys = np.meshgrid(np.linspace(0.05, 0.95, grid),
+                          np.linspace(0.05, 0.95, grid))
+    return np.stack([xs.ravel(), ys.ravel()], axis=-1)
+
+
+# Coarser regular grid (IR thermal sensors are typically much lower-res
+# than RGB: ~160x120 or 80x60 vs 1080p).
+def pattern_ir_thermal(grid=12):
+    xs, ys = np.meshgrid(np.linspace(0.05, 0.95, grid),
+                          np.linspace(0.05, 0.95, grid))
+    return np.stack([xs.ravel(), ys.ravel()], axis=-1)
+
+
+# Dense grid with characteristic depth holes (Kinect, RealSense, ToF).
+# Real depth sensors drop pixels at: reflective/dark surfaces, depth
+# discontinuities, out-of-range distances. Structured-light systems also
+# show occasional vertical 'occlusion shadows' from the baseline; we add
+# a few of those.
+def pattern_depth_camera(grid=24, hole_fraction=0.18, rng=None):
+    if rng is None: rng = np.random.RandomState(1)
+    xs, ys = np.meshgrid(np.linspace(0.05, 0.95, grid),
+                          np.linspace(0.05, 0.95, grid))
+    pts = np.stack([xs.ravel(), ys.ravel()], axis=-1)
+    keep = rng.uniform(size=len(pts)) > hole_fraction
+    for stripe_x in rng.uniform(0.2, 0.8, size=2):
+        in_stripe = np.abs(pts[:, 0] - stripe_x) < 0.04
+        keep &= ~in_stripe
+    return pts[keep]
+
+
+# Sparse async events along noisy curves (DVS / ATIS event cameras fire
+# only on intensity-change crossings, so events cluster along moving
+# edges). Without scene content we sample around a few wandering curves
+# with Gaussian thickness — the visual signature of an event-camera trace.
+def pattern_ebc_events(n_events=350, rng=None):
+    if rng is None: rng = np.random.RandomState(2)
+    pts = []
+    n_curves = rng.randint(3, 5)
+    for _ in range(n_curves):
+        t = np.linspace(0, 1, 80)
+        ax = rng.uniform(-0.4, 0.4); bx = rng.uniform(-0.2, 0.2)
+        ay = rng.uniform(-0.4, 0.4); by = rng.uniform(-0.2, 0.2)
+        cx = rng.uniform(0.2, 0.8); cy = rng.uniform(0.2, 0.8)
+        x = cx + ax * np.sin(2 * np.pi * t) + bx * t
+        y = cy + ay * np.cos(2 * np.pi * t) + by * t
+        n_per_curve = n_events // n_curves
+        noise = rng.normal(0, 0.018, size=(n_per_curve, 2))
+        idx = rng.choice(len(t), size=n_per_curve)
+        pts.append(np.stack([x[idx], y[idx]], axis=-1) + noise)
+    out = np.concatenate(pts, axis=0)
+    out = np.clip(out, 0.03, 0.97)
     return out
 
 
-# simulate_ebc — event-based-camera output from two RGB frames.
-#   positive polarity (intensity increased > threshold) → red
-#   negative polarity (intensity decreased > threshold) → blue
-#   otherwise → dark background.
-# Visualizes the standard accumulated-events-over-Δt representation.
-def simulate_ebc(rgb_a, rgb_b, threshold=0.04,
-                  background=(8, 8, 12),
-                  pos_color=(245, 60, 60),
-                  neg_color=(60, 120, 245)):
-    ga = rgb_a.astype(np.float32).mean(-1) / 255.0
-    gb = rgb_b.astype(np.float32).mean(-1) / 255.0
-    diff = gb - ga
-    pos = diff >  threshold
-    neg = diff < -threshold
-    H, W = ga.shape
-    out = np.zeros((H, W, 3), dtype=np.uint8)
-    out[..., 0] = background[0]; out[..., 1] = background[1]; out[..., 2] = background[2]
-    out[pos] = pos_color
-    out[neg] = neg_color
-    return out
+# Horizontal scan lines from a rotating LiDAR (Velodyne-style). Each ring
+# is a row of dots at a fixed vertical angle. Real sensors have 16/32/64/
+# 128 rings; we use evenly-spaced rings for clarity. The small horizontal
+# jitter mimics angular-encoder noise.
+def pattern_lidar_scan_lines(n_rings=10, n_per_ring=44, rng=None):
+    if rng is None: rng = np.random.RandomState(3)
+    pts = []
+    ys = np.linspace(0.08, 0.92, n_rings)
+    for y in ys:
+        x = np.linspace(0.04, 0.96, n_per_ring)
+        x = x + rng.normal(0, 0.003, n_per_ring)
+        pts.append(np.stack([x, np.full_like(x, y)], axis=-1))
+    return np.concatenate(pts, axis=0)
 """)
 
 
 # =============================================================================
-md(r"""## §3. Generate one scene → render five sensors
+md(r"""## §3. The figure
 
-We sample one scene with `LinkedPrimitivesVideoGenerator` (so we have
-the two frames needed for the EBC simulation). The first frame is used
-for all the dense / sparse modalities; the EBC tile uses the diff
-between frames 0 and 4.
+Five tiles in a row. Each is a unit square with a thick black border
+containing black sample dots; nothing else. Below each tile: the sensor
+name and the sample count.
 """)
-code(r"""IMG = 144
-gen_video = LinkedPrimitivesVideoGenerator(operating_point="basic",
-                                            image_size=IMG, base_seed=7)
-scene_v = gen_video.sample_scene(seed=7)
-video = gen_video.render_video_pair(scene_v)
+code(r"""rgb_pts   = pattern_rgb_camera(grid=28)
+ir_pts    = pattern_ir_thermal(grid=12)
+depth_pts = pattern_depth_camera(grid=24, hole_fraction=0.18)
+ebc_pts   = pattern_ebc_events(n_events=350)
+lidar_pts = pattern_lidar_scan_lines(n_rings=10, n_per_ring=44)
 
-# For modalities that need the static-renderer plumbing (depth, IR, LiDAR),
-# build a per-frame render dict and attach depth+meta. We reuse the video
-# generator's first-frame output and synthesise depth from its seg.
-def video_frame_with_depth(scene_v, video, view, frame_idx):
-    out = {
-        "rgb":  video[f"view_{view}"]["rgb"][frame_idx],
-        "seg":  video[f"view_{view}"]["seg"][frame_idx],
-        "kpts": video[f"view_{view}"]["kpts"][frame_idx],
-        "vis":  video[f"view_{view}"]["vis"][frame_idx],
-        "ids":  video[f"view_{view}"]["ids"],
-    }
-    view_mat = scene_v.view_A if view == "A" else scene_v.view_B
-    prims = scene_v.linked + (scene_v.distractors_A if view == "A" else scene_v.distractors_B)
-    depth = np.full(out["seg"].shape, np.nan, dtype=np.float32)
-    for p in prims:
-        # For animated primitives, use the position at the right τ
-        tau = float(frame_idx / max(video["view_A"]["rgb"].shape[0] - 1, 1))
-        pos_3d = p.trajectory.pos_at(tau)
-        screen, z = _project(pos_3d, view_mat,
-                              focal=FOCAL_DEFAULT, camera_back=CAMERA_BACK_DEFAULT)
-        if screen is None: continue
-        depth[out["seg"] == p.pid] = z
-    out["depth"] = depth
-    out["primitives_meta"] = {p.pid: (p.shape_id, p.color_idx) for p in prims}
-    return out
-
-
-# Build one enriched render at frame 0 (used by IR / depth / LiDAR tiles)
-enriched = video_frame_with_depth(scene_v, video, view="A", frame_idx=0)
-
-# Sensor-specific outputs
-dense_rgb = enriched["rgb"]                                 # 1. Dense RGB
-ir_out    = InfraredModality()(enriched)["rgb"]              # 2. Infrared
-depth_out = DepthCameraModality()(enriched)["rgb"]           # 3. Depth
-ebc_out   = simulate_ebc(                                    # 4. EBC
-    video["view_A"]["rgb"][0],
-    video["view_A"]["rgb"][4],
-)
-lidar_out = LiDARModality(keep_fraction=0.18)(enriched, rng=7)["rgb"]   # 5. LiDAR
-
-print(f"All five sensor outputs ready, image size = {IMG}x{IMG}.")
-""")
-
-
-# =============================================================================
-md(r"""## §4. The figure
-
-A single row, five tiles, thick black borders. Each tile shows the same
-underlying scene through a different sensor. The point: the same world
-produces five very different observations — and an SSL recipe for
-sensor fusion has to find the latent scene shared across all of them.
-""")
-code(r"""TILES = [
-    ("Dense RGB",     dense_rgb,  "wide-FOV camera, color + intensity"),
-    ("Infrared",      ir_out,     "temperature → inferno colormap"),
-    ("Depth",         depth_out,  "z-distance → viridis colormap"),
-    ("EBC",           ebc_out,    "polarity events  (red = +, blue = −)"),
-    ("LiDAR",         lidar_out,  "sparse depth returns (~15%)"),
+TILES = [
+    ("RGB camera",   "dense regular grid",            rgb_pts,   1.6),
+    ("IR thermal",   "coarser dense grid",            ir_pts,    8.0),
+    ("Depth camera", "dense + depth holes",           depth_pts, 2.5),
+    ("EBC",          "sparse async events",           ebc_pts,   4.5),
+    ("LiDAR",        "horizontal scan rings",         lidar_pts, 3.5),
 ]
 
-fig, axes = plt.subplots(1, len(TILES), figsize=(4.0 * len(TILES), 4.6))
-for ax, (name, img, descr) in zip(axes, TILES):
-    ax.imshow(img)
+fig, axes = plt.subplots(1, len(TILES), figsize=(3.6 * len(TILES), 4.4))
+for ax, (name, descr, pts, marker_size) in zip(axes, TILES):
+    ax.scatter(pts[:, 0], pts[:, 1], s=marker_size,
+                c='black', marker='o', alpha=0.95, linewidths=0)
+    ax.set_xlim(0.0, 1.0); ax.set_ylim(0.0, 1.0)
+    ax.set_aspect('equal')
+    ax.invert_yaxis()       # match image convention (origin top-left)
     ax.set_xticks([]); ax.set_yticks([])
-    # Thick black border via axes spines
     for side in ("top", "right", "bottom", "left"):
         ax.spines[side].set_visible(True)
         ax.spines[side].set_linewidth(3.5)
-        ax.spines[side].set_edgecolor("black")
-    ax.set_title(name, fontsize=14, weight="bold", pad=10)
-    ax.set_xlabel(descr, fontsize=10, labelpad=8)
+        ax.spines[side].set_edgecolor('black')
+    ax.set_title(name, fontsize=15, weight='bold', pad=12)
+    ax.set_xlabel(f"{descr}\nN = {len(pts):,} samples", fontsize=10, labelpad=10)
 
-plt.suptitle("Five sensor modalities, one underlying scene", fontsize=15, y=1.02)
+plt.suptitle("Stereotypical sensor sampling patterns", fontsize=16, y=1.02)
 plt.tight_layout()
-plt.savefig("data_schemes.png", dpi=150, bbox_inches="tight")
+plt.savefig("sensor_sampling_patterns.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Saved → data_schemes.png")
+print("Saved → sensor_sampling_patterns.png")
 """)
 
 
 # =============================================================================
-md(r"""## §5. Reading the figure
+md(r"""## §4. Reading the figure
 
-What each tile reveals:
+Each tile encodes one fact about its sensor:
 
-* **Dense RGB** — colours and shapes are visible; standard vision sensor.
-  Carries the most per-pixel information (colour + intensity) but loses
-  depth and material identity.
-* **Infrared** — colour is replaced by a temperature heatmap. Different
-  primitives may share the same temperature, so IR alone cannot always
-  tell them apart. Carries weak material identity, no geometric depth.
-* **Depth camera** — colour and material are gone; every pixel encodes
-  z-distance from the sensor. Carries strong geometric information and
-  zero appearance information.
-* **EBC (event-based camera)** — black almost everywhere; only PIXELS
-  WHERE INTENSITY CHANGED between two timesteps carry an event. Per
-  pixel, 1 bit of polarity (+ or −). Carries motion + edges but no
-  static appearance or absolute intensity.
-* **LiDAR** — sparse depth points. Per-point depth, no colour, very
-  sparse coverage. Carries the same kind of info as depth-camera but
-  at a sparser sampling rate.
+- **RGB camera** — uniform dense grid. Maximum spatial coverage. The
+  reference point: every other modality is some kind of subsampling,
+  redistribution, or alternative measurement of this base layout.
+- **IR thermal** — same uniform layout, but at a much coarser
+  resolution. Thermal sensors trade resolution for the ability to
+  measure long-wavelength emission, so spatial density drops.
+- **Depth camera** — almost as dense as RGB, but with characteristic
+  per-pixel dropouts ("depth holes") from reflective surfaces, depth
+  discontinuities, out-of-range objects, and (for structured-light /
+  stereo systems) occlusion shadows visible as the vertical stripes.
+- **EBC** — total break from the grid. Events are unstructured points
+  triggered only by per-pixel intensity changes. No regular layout, no
+  guaranteed coverage of static regions. What you see here are events
+  clustered along moving edges — the only place a DVS pixel fires.
+- **LiDAR** (rotating) — points are organized in horizontal rings, not
+  a grid. Each ring is one rotation of the spinning sensor at a fixed
+  vertical angle. Sample density is high horizontally within each
+  ring, low vertically between rings — exactly the opposite of a
+  camera's near-isotropic pixel grid.
 
-Sensor fusion is about reconciling these into a single latent scene
-representation. The benchmark is engineered so that **no single
-modality** carries enough information to solve the downstream task on
-its own.
+The benchmark's `multiview_primitives.py` simulates three of these
+(LiDAR, Infrared, Depth) as the three views of the sensor-fusion
+variant; the SSL recipe has to learn the common latent scene despite
+these very different sampling patterns.
 """)
 
 
